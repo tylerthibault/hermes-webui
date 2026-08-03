@@ -1601,7 +1601,10 @@
                   <div class="settings-field"><label for="matrixE2eeMode">Encryption</label><select id="matrixE2eeMode" style="width:100%"><option value="required">Required</option><option value="optional">Optional</option><option value="off">Off</option></select></div>
                 </div>
                 <div class="settings-field"><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input id="matrixAutoThread" type="checkbox"><span>Automatically create/use threads</span></label></div>
+                <div id="matrixRegistrationSecretField" class="settings-field" hidden><label for="matrixRegistrationSecret">Synapse registration secret (one-time)</label><input id="matrixRegistrationSecret" type="password" autocomplete="off" spellcheck="false" placeholder="Used once; never saved"></div>
+                <div id="matrixProvisioningHint" hidden style="font-size:11px;color:var(--muted);margin-top:10px"></div>
                 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+                  <button class="sm-btn" id="matrixCreateAccountBtn" type="button" onclick="createMatrixAccount()" hidden>Create Matrix account</button>
                   <button class="sm-btn" id="matrixSaveBtn" type="submit">Save</button>
                   <button class="sm-btn" id="matrixRestartBtn" type="button" onclick="saveAndRestartMatrixGateway()">Save &amp; Restart Gateway</button>
                   <button class="sm-btn" id="matrixClearBtn" type="button" onclick="clearMatrixChannel()" style="color:var(--error,#e05)">Disconnect</button>

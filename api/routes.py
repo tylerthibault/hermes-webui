@@ -14021,6 +14021,16 @@ def handle_post(handler, parsed) -> bool:
         except ValueError as exc:
             return bad(handler, str(exc), status=400)
 
+    if parsed.path == "/api/channels/matrix/provision":
+        from api.channels import MatrixProvisioningError, provision_matrix_account
+
+        try:
+            return j(handler, provision_matrix_account(body))
+        except MatrixProvisioningError as exc:
+            return bad(handler, str(exc), status=exc.status)
+        except ValueError as exc:
+            return bad(handler, str(exc), status=400)
+
     if parsed.path == "/api/channels/matrix/clear":
         from api.channels import clear_matrix_channel
 

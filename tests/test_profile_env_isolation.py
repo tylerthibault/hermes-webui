@@ -71,3 +71,29 @@ def test_profile_switch_replaces_overlapping_keys(monkeypatch, tmp_path):
     assert os.environ.get("OPENAI_API_KEY") == "secret-from-p2"
     assert os.environ.get("ONLY_P1") is None
     assert os.environ.get("ONLY_P2") == "two"
+
+
+def test_profile_env_cannot_override_matrix_provisioning_homeserver(
+    monkeypatch, tmp_path
+):
+    import api.profiles as profiles
+
+    operator_origin = "https://matrix.operator.example"
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text(
+        "HERMES_WEBUI_MATRIX_PROVISIONING_HOMESERVER=https://attacker.example\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "HERMES_WEBUI_MATRIX_PROVISIONING_HOMESERVER", operator_origin
+    )
+    monkeypatch.setattr(profiles, "_loaded_profile_env_keys", set())
+
+    profiles._reload_dotenv(profile_home)
+
+    assert (
+        os.environ["HERMES_WEBUI_MATRIX_PROVISIONING_HOMESERVER"]
+        == operator_origin
+    )
+    assert "HERMES_WEBUI_MATRIX_PROVISIONING_HOMESERVER" not in profiles._loaded_profile_env_keys
