@@ -468,7 +468,7 @@ def provision_matrix_account(payload: dict) -> dict:
     requested_homeserver = payload.get("homeserver")
     homeserver = _validate_homeserver(requested_homeserver)
     provisioning_homeserver = _provisioning_homeserver()
-    if not provisioning_homeserver or requested_homeserver != provisioning_homeserver:
+    if not provisioning_homeserver or homeserver != provisioning_homeserver:
         raise ValueError("homeserver must exactly match the operator-configured homeserver")
     registration_secret = _validate_opaque_secret(
         payload.get("registration_secret"),

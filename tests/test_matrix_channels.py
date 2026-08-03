@@ -234,6 +234,26 @@ def test_provisioning_rejects_homeserver_not_exactly_allowed_by_operator(
         )
 
 
+def test_provisioning_compares_normalized_operator_homeserver(
+    channels, monkeypatch
+):
+    monkeypatch.setattr(
+        channels,
+        "_register_synapse_user",
+        lambda *_args: "@maverick:example.org",
+    )
+
+    result = channels.provision_matrix_account(
+        _valid_payload(
+            homeserver="  https://matrix.example.org  ",
+            password="correct-horse-battery-staple",
+            registration_secret="registration-secret",
+        )
+    )
+
+    assert result["user_id"] == "@maverick:example.org"
+
+
 def test_provision_matrix_account_creates_non_admin_profile_account_and_saves_channel(
     channels, monkeypatch, tmp_path
 ):

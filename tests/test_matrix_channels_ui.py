@@ -42,10 +42,13 @@ def test_channels_routes_are_registered_for_get_save_clear_and_restart():
 def test_matrix_account_provisioning_control_and_route_exist():
     assert 'id="matrixCreateAccountBtn"' in INDEX
     assert 'id="matrixRegistrationSecret"' in INDEX
+    assert 'id="matrixRegistrationSecretField" class="settings-field" hidden' in INDEX
     assert 'type="password"' in INDEX
     assert "Create Matrix account" in INDEX
     assert "registration_secret" in FRONTEND
     assert "registrationSecret.value=''" in FRONTEND
+    assert "const secretField=registrationSecret.closest('.settings-field')" in FRONTEND
+    assert "if(secretField)secretField.hidden" in FRONTEND
     assert "function createMatrixAccount" in FRONTEND
     assert 'parsed.path == "/api/channels/matrix/provision"' in ROUTES
     assert "provision_matrix_account" in ROUTES

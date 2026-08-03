@@ -37,7 +37,7 @@ function _renderMatrixChannel(data){
   const createBtn=$('matrixCreateAccountBtn'),provisioningHint=$('matrixProvisioningHint'),registrationSecret=$('matrixRegistrationSecret'),canProvision=!!data.provisioning_available&&!data.configured;
   if(createBtn){createBtn.hidden=!canProvision;createBtn.disabled=!canProvision;}
   if(provisioningHint){provisioningHint.hidden=!!data.configured;provisioningHint.textContent=data.configured?'':(canProvision?'Creates a non-admin Matrix account named after this Hermes profile. The registration secret is used once and never saved.':'Account creation is disabled until the operator configures a provisioning homeserver.');}
-  if(registrationSecret){registrationSecret.value='';registrationSecret.closest('.settings-field').hidden=!canProvision;}
+  if(registrationSecret){registrationSecret.value='';const secretField=registrationSecret.closest('.settings-field');if(secretField)secretField.hidden=!canProvision;}
   syncMatrixAuthFields();
 }
 async function loadChannelsPanel(){
