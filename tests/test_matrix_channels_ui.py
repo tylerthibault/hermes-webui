@@ -37,3 +37,35 @@ def test_channels_routes_are_registered_for_get_save_clear_and_restart():
     assert "save_matrix_channel" in ROUTES
     assert "clear_matrix_channel" in ROUTES
     assert "restart_matrix_gateway" in ROUTES
+
+
+def test_matrix_account_provisioning_control_and_route_exist():
+    assert 'id="matrixCreateAccountBtn"' in INDEX
+    assert 'id="matrixRegistrationSecret"' in INDEX
+    assert 'type="password"' in INDEX
+    assert "Create Matrix account" in INDEX
+    assert "registration_secret" in FRONTEND
+    assert "registrationSecret.value=''" in FRONTEND
+    assert "function createMatrixAccount" in FRONTEND
+    assert 'parsed.path == "/api/channels/matrix/provision"' in ROUTES
+    assert "provision_matrix_account" in ROUTES
+
+
+def test_matrix_async_actions_guard_terminal_ui_updates_against_stale_profile():
+    assert "function _channelsRequestIsCurrent" in CHANNELS
+    for function_name in (
+        "saveMatrixChannel",
+        "restartMatrixGateway",
+        "createMatrixAccount",
+        "clearMatrixChannel",
+    ):
+        function_source = CHANNELS.split(f"async function {function_name}", 1)[1].split(
+            "async function ", 1
+        )[0]
+        assert "const generation=_channelsGeneration" in function_source
+        assert "_channelsRequestIsCurrent(generation,profile)" in function_source
+
+
+def test_matrix_provisioning_ui_honors_backend_availability_and_origin():
+    assert "provisioning_available" in CHANNELS
+    assert "provisioning_homeserver" in CHANNELS
