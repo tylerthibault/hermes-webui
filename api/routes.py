@@ -30,7 +30,7 @@ import http.client
 import socket as _socket
 from collections import defaultdict, deque
 from pathlib import Path
-from contextlib import closing
+from contextlib import closing, nullcontext
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
@@ -2794,6 +2794,7 @@ from api.config import (
     STREAM_LAST_EVENT_ID,
     SERVER_START_TIME,
     _resolve_cli_toolsets,
+    _resolve_webui_toolsets,
     get_available_models,
     get_available_models_for_session_visit,
     _provider_is_known_or_configured,
@@ -6837,6 +6838,40 @@ def _read_profile_model_config(
             return None, None, _pcfg
         return None, _default, _pcfg
     return _provider, _default, _pcfg
+
+
+def _webui_tool_config_for_session(session, profile_config):
+    """Return the authoritative tool config, denying named-profile load failures."""
+    if getattr(session, "profile", None):
+        if isinstance(profile_config, dict):
+            return profile_config
+        return {"platform_toolsets": {"webui": []}}
+    return profile_config if isinstance(profile_config, dict) else get_config()
+
+
+def _gateway_backend_allowed_for_webui_policy(enabled, tool_config, selected_toolsets):
+    """Keep policy-constrained browser turns out of the ambient Gateway protocol."""
+    if not enabled or not isinstance(tool_config, dict) or selected_toolsets is not None:
+        return False
+    platform_toolsets = tool_config.get("platform_toolsets")
+    return not (
+        isinstance(platform_toolsets, dict)
+        and isinstance(platform_toolsets.get("webui"), list)
+    )
+
+
+def _sync_profile_agent_scope(session):
+    """Bind synchronous agent/tool initialization to the session's profile."""
+    profile = str(getattr(session, "profile", None) or "").strip()
+    if not profile:
+        return nullcontext()
+    from api.profiles import profile_env_for_background_worker
+
+    return profile_env_for_background_worker(
+        profile,
+        "synchronous WebUI agent turn",
+        logger_override=logger,
+    )
 
 
 # perf(webui/session-load-latency) tier2a: process-wide cache for parsed
@@ -21201,8 +21236,18 @@ def _start_chat_stream_for_session(
     external_runtime_owned: bool | None = None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
-    if external_runtime_owned is None:
-        external_runtime_owned = webui_gateway_chat_enabled(get_config())
+    gateway_requested = (
+        webui_gateway_chat_enabled(get_config())
+        if external_runtime_owned is None
+        else bool(external_runtime_owned)
+    )
+    profile_config = _read_profile_model_config(s, model_provider)[2]
+    tool_config = _webui_tool_config_for_session(s, profile_config)
+    external_runtime_owned = _gateway_backend_allowed_for_webui_policy(
+        gateway_requested,
+        tool_config,
+        getattr(s, "enabled_toolsets", None),
+    )
     backend_is_gateway = bool(external_runtime_owned)
     stale_response = _agent_runtime_barrier_response(
         external_runtime_owned=backend_is_gateway,
@@ -22245,7 +22290,12 @@ def _handle_chat_start(handler, body, diag=None):
         explicit_model_pick = bool(body.get("explicit_model_pick"))
         moa_config = None
         config_snapshot = get_config_snapshot()
-        gateway_chat_enabled = webui_gateway_chat_enabled(config_snapshot)
+        _tool_policy_cfg = _webui_tool_config_for_session(s, _pp_cfg)
+        gateway_chat_enabled = _gateway_backend_allowed_for_webui_policy(
+            webui_gateway_chat_enabled(config_snapshot),
+            _tool_policy_cfg,
+            getattr(s, "enabled_toolsets", None),
+        )
         if body.get("moa_config"):
             if gateway_chat_enabled:
                 return bad(handler, "MoA override is unavailable on gateway-backed sessions", 409)
@@ -22472,7 +22522,10 @@ def _handle_chat_sync(handler, body):
     try:
         AIAgent = require_ai_agent_class()
 
-        with CHAT_LOCK:
+        # AIAgent construction discovers MCP servers and profile-scoped tools.
+        # Bind the explicit session profile for the whole synchronous turn so
+        # neither initialization nor execution can consult the ambient profile.
+        with CHAT_LOCK, _sync_profile_agent_scope(s):
             from api.config import (
                 resolve_model_provider,
                 resolve_custom_provider_connection,
@@ -22517,7 +22570,10 @@ def _handle_chat_sync(handler, body):
                 # does not inject CLI-specific terminal/output guidance.
                 platform="webui",
                 quiet_mode=True,
-                enabled_toolsets=_resolve_cli_toolsets(),
+                enabled_toolsets=_resolve_webui_toolsets(
+                    _webui_tool_config_for_session(s, _pp_cfg),
+                    selected_toolsets=getattr(s, "enabled_toolsets", None),
+                ),
                 session_id=s.session_id,
             )
             from api.streaming import (
@@ -24829,7 +24885,16 @@ def _handle_session_compress(handler, body):
             # does not inject CLI-specific terminal/output guidance.
             platform="webui",
             quiet_mode=True,
-            enabled_toolsets=_resolve_cli_toolsets(),
+            enabled_toolsets=_resolve_webui_toolsets(
+                _webui_tool_config_for_session(
+                    s,
+                    _read_profile_model_config(
+                        s,
+                        getattr(s, "model_provider", None),
+                    )[2],
+                ),
+                selected_toolsets=getattr(s, "enabled_toolsets", None),
+            ),
             session_id=sid,
         )
         compressed = agent.context_compressor.compress(

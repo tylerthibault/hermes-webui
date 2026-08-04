@@ -333,6 +333,18 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 
 If discovery finds everything, nothing else is required.
 
+### Channel-specific tool permissions
+
+Browser sessions resolve tools from `platform_toolsets.webui` in the active profile’s `config.yaml`. This lets a password- or passkey-protected operator WebUI have broader capabilities than messaging channels such as Matrix or Discord:
+
+```yaml
+platform_toolsets:
+  webui: [browser, file, terminal, skills, web]
+  matrix: [clarify, cronjob, skills, web]
+```
+
+An explicit `webui` list—including an empty list—is the maximum browser capability set. MCP toolsets are not auto-added beyond that ceiling, and a per-session tool selection can only narrow it. Profiles without a list-valued `webui` entry continue to inherit `platform_toolsets.cli` (including its legacy MCP resolution) for backward compatibility. Tool access is a capability boundary, not an approval policy: protect any broadly capable WebUI with strong authentication and still require confirmation for consequential actions.
+
 ---
 
 ### Overrides (only needed if auto-detection misses)

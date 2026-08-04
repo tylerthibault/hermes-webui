@@ -7607,6 +7607,25 @@ def _refresh_cached_agent_primary_runtime_snapshot(agent) -> None:
             rt['is_anthropic_oauth'] = getattr(agent, '_is_anthropic_oauth')
 
 
+def _load_session_toolset_selection(session, session_id):
+    """Prefer fresh metadata, retaining the already-loaded session on read failure."""
+    override = getattr(session, 'enabled_toolsets', None)
+    try:
+        from api.models import Session, SESSION_DIR
+
+        session_path = SESSION_DIR / f"{session_id}.json"
+        if session_path.exists():
+            session_meta = Session.load_metadata_only(session_id)
+            if session_meta is not None:
+                override = getattr(session_meta, 'enabled_toolsets', None)
+    except Exception as exc:
+        print(
+            f"[webui] WARNING: failed to read per-session toolsets for {session_id}: {exc}",
+            flush=True,
+        )
+    return override
+
+
 def _run_agent_streaming(
     session_id,
     msg_text,
@@ -8997,10 +9016,16 @@ def _run_agent_streaming(
             # actually runs under.
             from api.config import get_config_for_profile_home as _get_config_for_home
             try:
-                _cfg = _get_config_for_home(_profile_home)
+                if getattr(s, 'profile', None):
+                    from api.routes import _read_profile_model_config
+
+                    _cfg = _read_profile_model_config(s, provider_context)[2]
+                    if _cfg is None:
+                        raise RuntimeError("session profile config could not be loaded")
+                else:
+                    _cfg = _get_config_for_home(_profile_home)
             except Exception:
-                from api.config import get_config as _get_config
-                _cfg = _get_config()
+                _cfg = {"platform_toolsets": {"webui": []}}
             _prefill_context = _load_webui_prefill_context(_cfg)
             _prefill_messages = _prefill_messages_with_webui_context(_prefill_context, _cfg)
             _prefill_messages = _normalize_prefill_messages_before_user_turn(_prefill_messages)
@@ -9014,29 +9039,10 @@ def _run_agent_streaming(
                 'prefill': _public_prefill_context_status(_prefill_context),
             })
 
-            # Per-profile toolsets — use _resolve_cli_toolsets() so MCP
-            # server toolsets are included, matching native CLI behaviour.
-            from api.config import _resolve_cli_toolsets
-            _toolsets = _resolve_cli_toolsets(_cfg)
-
-            # Per-session toolset override (#493): if the session has
-            # enabled_toolsets set, use that instead of the global config.
-            try:
-                from api.models import Session, SESSION_DIR
-                _session_path = SESSION_DIR / f"{session_id}.json"
-                if _session_path.exists():
-                    _session_meta = Session.load_metadata_only(session_id)
-                    # load_metadata_only returns a Session INSTANCE, not a dict.
-                    # The previous .get('enabled_toolsets') raised AttributeError
-                    # which was swallowed by the bare except below — the entire
-                    # per-session toolset override silently no-op'd. Use
-                    # getattr() to read the attribute correctly.
-                    # (Opus pre-release advisor finding for v0.50.257.)
-                    _override = getattr(_session_meta, 'enabled_toolsets', None) if _session_meta else None
-                    if _override:
-                        _toolsets = _override
-            except Exception as _ts_err:
-                print(f"[webui] WARNING: failed to read per-session toolsets for {session_id}: {_ts_err}", flush=True)
+            # Per-session toolset selection (#493). The shared resolver applies
+            # this only as a narrowing of the profile's WebUI allowance.
+            from api.config import _resolve_webui_toolsets
+            _override = _load_session_toolset_selection(s, session_id)
 
             # Fallback model chain from profile config (e.g. for rate-limit or
             # provider recovery). Match Hermes CLI/gateway semantics:
@@ -9149,6 +9155,12 @@ def _run_agent_streaming(
             except Exception:
                 _reasoning_config = None
 
+            # Resolve once so agent construction and the cache identity consume
+            # the same effective capability set.
+            _toolsets = _resolve_webui_toolsets(
+                _cfg,
+                selected_toolsets=_override,
+            )
             _agent_kwargs = dict(
                 model=resolved_model,
                 provider=resolved_provider,

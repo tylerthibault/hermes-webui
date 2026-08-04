@@ -1111,6 +1111,75 @@ def _resolve_cli_toolsets(cfg=None):
         # Fallback: read raw list from config (MCP toolsets will be missing)
         return _normalize_cli_toolsets(cfg.get("platform_toolsets", {}).get("cli", _DEFAULT_TOOLSETS))
 
+
+def _resolve_webui_toolsets(cfg=None, *, selected_toolsets=None, config_loaded=True):
+    """Resolve the effective browser-session tools within the profile ceiling.
+
+    ``platform_toolsets.webui`` is authoritative when it is an explicit list,
+    including an empty list. Profiles created before WebUI had its own platform
+    key continue to inherit ``platform_toolsets.cli`` for compatibility. A
+    per-session selection may narrow the resolved allowance, but never add to it.
+    """
+    if not config_loaded:
+        return []
+    if cfg is None:
+        cfg = get_config()
+    platform_toolsets = cfg.get("platform_toolsets") or {}
+    if not isinstance(platform_toolsets, dict):
+        platform_toolsets = {}
+    webui_toolsets = platform_toolsets.get("webui")
+    if not isinstance(webui_toolsets, list):
+        # Preserve legacy CLI selection (including MCP additions) for old
+        # profiles, but do not inherit _resolve_cli_toolsets()'s permissive
+        # catch-all: a loaded resolver whose policy evaluation fails is unsafe.
+        try:
+            from hermes_cli.tools_config import _get_platform_tools
+        except ModuleNotFoundError as exc:
+            if exc.name != "hermes_cli":
+                return []
+            allowed = _normalize_cli_toolsets(
+                platform_toolsets.get("cli", _DEFAULT_TOOLSETS)
+            )
+        except ImportError:
+            return []
+        else:
+            try:
+                allowed = _normalize_cli_toolsets(
+                    _get_platform_tools(cfg, "cli")
+                )
+            except Exception:
+                return []
+    else:
+        ceiling = _normalize_cli_toolsets(webui_toolsets)
+        if not ceiling:
+            return []
+        try:
+            from hermes_cli.tools_config import _get_platform_tools
+        except ModuleNotFoundError as exc:
+            if exc.name != "hermes_cli":
+                return []
+            # Standalone WebUI installs without Hermes Agent retain the explicit
+            # raw list. Runtime failures after a successful import are different:
+            # policy could not be evaluated, so they must fail closed.
+            allowed = ceiling
+        except ImportError:
+            return []
+        else:
+            try:
+                resolved = _normalize_cli_toolsets(_get_platform_tools(cfg, "webui"))
+            except Exception:
+                return []
+            ceiling_names = set(ceiling)
+            allowed = [name for name in resolved if name in ceiling_names]
+
+    if selected_toolsets is None:
+        return allowed
+    if not isinstance(selected_toolsets, list):
+        return []
+    selected_names = set(_normalize_cli_toolsets(selected_toolsets))
+    return [name for name in allowed if name in selected_names]
+
+
 CLI_TOOLSETS = _resolve_cli_toolsets()
 
 # ── Model / provider discovery ───────────────────────────────────────────────
