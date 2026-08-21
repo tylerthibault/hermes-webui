@@ -10367,6 +10367,8 @@ button:hover{background:rgba(124,185,255,.25)}
   <p class="sub"{{PASSWORD_SUBTITLE_HIDDEN}}>{{LOGIN_SUBTITLE}}</p>
   <section id="password-login-section"{{PASSWORD_LOGIN_HIDDEN}}>
     <form id="login-form" data-invalid-pw="{{LOGIN_INVALID_PW}}" data-conn-failed="{{LOGIN_CONN_FAILED}}">
+      <label class="visually-hidden" for="username">Username</label>
+      <input type="text" id="username" placeholder="Username" autocomplete="username"{{USERNAME_LOGIN_HIDDEN}}>
       <label class="visually-hidden" for="password">{{LOGIN_PLACEHOLDER}}</label>
       <input type="password" id="password" placeholder="{{LOGIN_PLACEHOLDER}}" autocomplete="current-password"{{PASSWORD_AUTOFOCUS}}>
       <button type="submit">{{LOGIN_BTN}}</button>
@@ -10472,10 +10474,14 @@ def _login_control_render_values(parsed) -> dict[str, str]:
     passkey_enabled = False
     try:
         from api.auth import get_password_hash
-
         password_enabled = get_password_hash() is not None
     except Exception:
         pass
+    try:
+        from api.auth_users import has_local_users
+        local_users_enabled = has_local_users()
+    except Exception:
+        local_users_enabled = False
     try:
         from api.auth_oidc import is_google_enabled
 
@@ -10507,10 +10513,12 @@ def _login_control_render_values(parsed) -> dict[str, str]:
     def hidden(enabled: bool) -> str:
         return "" if enabled else " hidden"
 
+    login_enabled = password_enabled or local_users_enabled
     return {
-        "{{PASSWORD_LOGIN_HIDDEN}}": hidden(password_enabled),
-        "{{PASSWORD_SUBTITLE_HIDDEN}}": hidden(password_enabled),
-        "{{PASSWORD_AUTOFOCUS}}": " autofocus" if password_enabled else "",
+        "{{PASSWORD_LOGIN_HIDDEN}}": hidden(login_enabled),
+        "{{PASSWORD_SUBTITLE_HIDDEN}}": hidden(login_enabled),
+        "{{USERNAME_LOGIN_HIDDEN}}": "" if local_users_enabled else " hidden",
+        "{{PASSWORD_AUTOFOCUS}}": " autofocus" if login_enabled else "",
         "{{PASSKEY_LOGIN_HIDDEN}}": hidden(passkey_enabled),
         "{{GOOGLE_LOGIN_HIDDEN}}": hidden(google_enabled),
         "{{GITHUB_LOGIN_HIDDEN}}": hidden(github_enabled),

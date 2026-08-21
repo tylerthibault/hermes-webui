@@ -4,13 +4,16 @@
  */
 document.addEventListener('DOMContentLoaded', function () {
   var form = document.getElementById('login-form');
-  var input = document.getElementById('pw');
+  var input = document.getElementById('password');
+  var usernameInput = document.getElementById('username');
+  var passwordSection = document.getElementById('password-login-section');
   var passkeyBtn = document.getElementById('passkey-login');
+  var googleLogin = document.getElementById('google-login');
+  var githubLogin = document.getElementById('github-login');
+  var oidcLogin = document.getElementById('oidc-login');
 
-  if (!form || !input) return;
-
-  var invalidPw = form.getAttribute('data-invalid-pw') || 'Invalid password';
-  var connFailed = form.getAttribute('data-conn-failed') || 'Connection failed';
+  var invalidPw = form ? (form.getAttribute('data-invalid-pw') || 'Invalid password') : 'Invalid password';
+  var connFailed = form ? (form.getAttribute('data-conn-failed') || 'Connection failed') : 'Connection failed';
 
   function showErr(msg) {
     var err = document.getElementById('err');
@@ -58,14 +61,24 @@ document.addEventListener('DOMContentLoaded', function () {
   }
 
   async function doLogin(e) {
-    e.preventDefault();
+    if (e) e.preventDefault();
+    if (!form || !input || (passwordSection && passwordSection.hidden)) return;
     var pw = input.value;
+    var username = usernameInput ? usernameInput.value.trim() : '';
+    if (!pw) {
+      showErr(invalidPw);
+      return;
+    }
+    if (usernameInput && !username) {
+      showErr(invalidPw);
+      return;
+    }
     hideErr();
     try {
       var res = await fetch('api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: pw }),
+        body: JSON.stringify(username ? { username: username, password: pw } : { password: pw }),
         credentials: 'include',
       });
       var data = {};
@@ -80,7 +93,7 @@ document.addEventListener('DOMContentLoaded', function () {
     }
   }
 
-  form.addEventListener('submit', doLogin);
+  if (form) form.addEventListener('submit', doLogin);
 
   function b64uToBytes(s) {
     s = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
@@ -99,7 +112,7 @@ document.addEventListener('DOMContentLoaded', function () {
   }
 
   async function doPasskeyLogin() {
-    if (!window.PublicKeyCredential || !navigator.credentials) return;
+    if (!passkeyBtn || !window.PublicKeyCredential || !navigator.credentials) return;
     hideErr();
     try {
       passkeyBtn.disabled = true;
@@ -139,20 +152,39 @@ document.addEventListener('DOMContentLoaded', function () {
     }
   }
 
-  if (passkeyBtn && window.PublicKeyCredential && navigator.credentials) {
-    fetch('api/auth/status', { credentials: 'include' })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (s) { if (s && s.passkeys_enabled) passkeyBtn.style.display = 'block'; })
-      .catch(function () {});
-    passkeyBtn.addEventListener('click', doPasskeyLogin);
+  var passkeySupported = !!(window.PublicKeyCredential && navigator.credentials);
+  if (passkeyBtn) {
+    if (!passkeySupported) passkeyBtn.hidden = true;
+    else passkeyBtn.addEventListener('click', doPasskeyLogin);
   }
 
-  input.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      doLogin(e);
-    }
-  });
+  // Capability discovery is unconditional: passwordless pages still need provider,
+  // passkey, and trusted-header initialization. Server-rendered state remains the
+  // fail-closed fallback if this request fails; provider hrefs are never rewritten.
+  fetch('api/auth/status', { credentials: 'include' })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (status) {
+      if (!status) return;
+      if (status.logged_in) {
+        window.location.href = _safeNextPath();
+        return;
+      }
+      if (passwordSection) passwordSection.hidden = !status.password_auth_enabled;
+      if (googleLogin) googleLogin.hidden = !status.google_enabled;
+      if (githubLogin) githubLogin.hidden = !status.github_enabled;
+      if (oidcLogin) oidcLogin.hidden = !status.oidc_enabled;
+      if (passkeyBtn) passkeyBtn.hidden = !(passkeySupported && status.passkeys_enabled);
+    })
+    .catch(function () {});
+
+  if (input) {
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        doLogin(e);
+      }
+    });
+  }
 
   // On page load, probe the server so we can distinguish "can't reach server"
   // (Tailscale off, wrong network) from "session expired / need to log in".
@@ -164,7 +196,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function setFormDisabled(disabled) {
       if (input) input.disabled = disabled;
-      var btn = form.querySelector('button');
+      var btn = form ? form.querySelector('button') : null;
       if (btn) btn.disabled = disabled;
     }
 
