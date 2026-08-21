@@ -1772,6 +1772,22 @@ function _initNavActionMirrors(){
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',_initNavActionMirrors,{once:true});
 else _initNavActionMirrors();
+function _initAdminUsersNav(){
+  const apply=async()=>{
+    let isAdmin=false;
+    try{
+      const response=await fetch('/api/auth/me',{credentials:'include',cache:'no-store'});
+      if(response.ok){const data=await response.json();isAdmin=data&&data.authenticated===true&&data.user&&data.user.role==='admin';}
+    }catch(_){/* unauthenticated or unavailable: keep the control hidden */}
+    document.querySelectorAll('[data-admin-users-link]').forEach(link=>{
+      link.style.display=isAdmin?'':'none';
+      link.classList.toggle('nav-action-visible',isAdmin);
+    });
+  };
+  void apply();
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',_initAdminUsersNav,{once:true});
+else _initAdminUsersNav();
 function _applyDashboardStatus(status){
   const running=!!(status&&status.running);
   const url=running?_dashboardBrowserUrl(status):'';
