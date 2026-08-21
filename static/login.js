@@ -84,7 +84,7 @@ document.addEventListener('DOMContentLoaded', function () {
       var data = {};
       try { data = await res.json(); } catch (_) {}
       if (res.ok && data.ok) {
-        window.location.href = _safeNextPath();
+        window.location.href = data.role === 'admin' ? '/admin/users' : _safeNextPath();
       } else {
         showErr(data.error || invalidPw);
       }

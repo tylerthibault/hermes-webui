@@ -12382,6 +12382,16 @@ def handle_get(handler, parsed) -> bool:
         from api.user_bots import list_bots
         return j(handler, {"bots": list_bots(principal["id"])})
 
+    if parsed.path == "/admin/users":
+        principal = _named_admin_principal(handler)
+        if principal is None:
+            return _redirect(handler, "/login?next=/admin/users")
+        page = (Path(__file__).parent.parent / "static" / "admin-users.html").resolve().read_text(encoding="utf-8")
+        from api.auth import csrf_token_for_session, parse_cookie, verify_session
+        cookie_value = parse_cookie(handler)
+        token = csrf_token_for_session(cookie_value) if cookie_value and verify_session(cookie_value) else ""
+        return t(handler, page.replace("window.__CSRF_TOKEN__", json.dumps(token)), content_type="text/html; charset=utf-8")
+
     if parsed.path == "/dashboard":
         from api.auth import current_principal
         principal = current_principal(handler)
