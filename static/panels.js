@@ -11692,7 +11692,7 @@ let _settingsPasswordEnvLocked=false;
 let _settingsPasswordAuthEnabled=false;
 function _setSettingsAuthButtonsVisible(active){
   const signOutBtn=$('btnSignOut');
-  if(signOutBtn) signOutBtn.style.display=active?'':'none';
+  if(signOutBtn) signOutBtn.style.display='';
   const disableBtn=$('btnDisableAuth');
   if(disableBtn) disableBtn.style.display=active?'':'none';
   const passkeyBtn=$('btnRegisterPasskey');
