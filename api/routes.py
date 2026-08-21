@@ -12385,7 +12385,20 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/admin/users":
         principal = _named_admin_principal(handler)
         if principal is None:
-            return _redirect(handler, "/login?next=/admin/users")
+            from api.auth import current_session_info
+            from api.auth_users import has_local_users
+            session = current_session_info(handler)
+            legacy_bootstrap = (
+                isinstance(session, dict)
+                and not session.get("user_id")
+                and not session.get("provider")
+                and not session.get("external_subject")
+                and not has_local_users()
+            )
+            if not legacy_bootstrap:
+                return _redirect(handler, "/login?next=/admin/users")
+            page = (Path(__file__).parent.parent / "static" / "bootstrap-admin.html").resolve().read_text(encoding="utf-8")
+            return t(handler, page, content_type="text/html; charset=utf-8")
         page = (Path(__file__).parent.parent / "static" / "admin-users.html").resolve().read_text(encoding="utf-8")
         from api.auth import csrf_token_for_session, parse_cookie, verify_session
         cookie_value = parse_cookie(handler)
@@ -14667,6 +14680,18 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/auth/bootstrap":
         if not _check_named_admin_origin(handler):
             return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        from api.auth import current_session_info
+        from api.auth_users import has_local_users
+        session = current_session_info(handler)
+        legacy_bootstrap = (
+            isinstance(session, dict)
+            and not session.get("user_id")
+            and not session.get("provider")
+            and not session.get("external_subject")
+            and not has_local_users()
+        )
+        if not legacy_bootstrap and _named_admin_principal(handler) is None:
+            return bad(handler, "Forbidden", 403)
         try:
             body = read_body(handler)
             allowed = {"username", "display_name", "password", "profiles"}
