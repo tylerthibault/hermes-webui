@@ -52,6 +52,8 @@ PUBLIC_PATHS = frozenset({
     '/login', '/health', '/favicon.ico', '/sw.js',
     '/api/auth/login', '/api/auth/status',
     '/api/auth/oidc/start', '/api/auth/oidc/callback',
+    '/api/auth/google/start', '/api/auth/google/callback',
+    '/api/auth/github/start', '/api/auth/github/callback',
     '/api/auth/passkey/options', '/api/auth/passkey/login',
     '/share',
     '/manifest.json', '/manifest.webmanifest',
@@ -535,12 +537,39 @@ def get_oidc_startup_warning() -> str | None:
     )
 
 
+def is_google_auth_enabled() -> bool:
+    """True if fixed-provider Google login is configured."""
+    try:
+        from api.auth_oidc import is_google_enabled
+
+        return is_google_enabled()
+    except Exception as exc:
+        logger.debug("Failed to inspect Google OIDC availability: %s", exc)
+        return False
+
+
+def is_github_auth_enabled() -> bool:
+    """True if fixed-endpoint GitHub OAuth login is configured."""
+    try:
+        from api.auth_github import is_github_enabled
+
+        return is_github_enabled()
+    except Exception as exc:
+        logger.debug("Failed to inspect GitHub OAuth availability: %s", exc)
+        return False
+
+
 def is_auth_enabled() -> bool:
-    """True if password auth, passkeys, OIDC login, or trusted-header auth is configured."""
+    """True if any supported WebUI authentication mechanism is configured."""
+    from api.auth_users import has_local_users
+
     return (
-        is_password_auth_enabled()
+        has_local_users()
+        or is_password_auth_enabled()
         or are_passkeys_enabled()
         or is_oidc_auth_enabled()
+        or is_google_auth_enabled()
+        or is_github_auth_enabled()
         or is_trusted_auth_enabled()
     )
 
@@ -576,18 +605,48 @@ def verify_password(plain: str) -> bool:
     return False
 
 
-def create_session(*, auth_type: str | None = None, username: str | None = None, bound_profile: str | None = None) -> str:
+def create_session(
+    *,
+    auth_type: str | None = None,
+    username: str | None = None,
+    bound_profile: str | None = None,
+    user_id: str | None = None,
+    provider: str | None = None,
+    external_issuer: str | None = None,
+    external_subject: str | None = None,
+    session_revocation_version: int | None = None,
+) -> str:
     """Create a new auth session. Returns signed cookie value."""
+    named_identity_supplied = any(
+        value is not None
+        for value in (user_id, provider, external_issuer, external_subject)
+    )
+    if named_identity_supplied and auth_type != "local":
+        user_id, provider, external_issuer, external_subject = (
+            _validate_named_external_identity(
+                user_id, provider, external_issuer, external_subject,
+                verify_owner=True,
+            )
+        )
     token = secrets.token_hex(32)
     expiry = time.time() + _resolve_session_ttl()
     record: float | dict
-    if any(value is not None for value in (auth_type, username, bound_profile)):
+    if any(value is not None for value in (
+        auth_type, username, bound_profile, user_id, provider,
+        external_issuer, external_subject, session_revocation_version,
+    )):
         record = {
             'expiry': expiry,
             'auth_type': auth_type,
             'username': username,
             'bound_profile': bound_profile,
+            'user_id': user_id,
+            'provider': provider,
+            'external_issuer': external_issuer,
+            'external_subject': external_subject,
         }
+        if auth_type == "local":
+            record['session_revocation_version'] = session_revocation_version
     else:
         record = expiry
     with _SESSIONS_LOCK:
@@ -595,6 +654,57 @@ def create_session(*, auth_type: str | None = None, username: str | None = None,
         _save_sessions(_sessions)
     sig = hmac.new(_signing_key(), token.encode(), hashlib.sha256).hexdigest()
     return f"{token}.{sig}"
+
+
+def _canonical_external_issuer(provider: str) -> str:
+    """Return the only issuer accepted for a named provider session."""
+    if provider == 'google':
+        from api.auth_oidc import _GOOGLE_ISSUER
+
+        return _GOOGLE_ISSUER
+    if provider == 'github':
+        from api.auth_github import GITHUB_ISSUER
+
+        return GITHUB_ISSUER
+    if provider == 'oidc':
+        from api.auth_oidc import _resolve_oidc_config
+
+        issuer = str(_resolve_oidc_config().get('issuer') or '').strip()
+        if issuer:
+            return issuer
+    raise ValueError('named session provider or issuer is not configured')
+
+
+def _validate_named_external_identity(
+    user_id,
+    provider,
+    external_issuer,
+    external_subject,
+    *,
+    verify_owner: bool = False,
+) -> tuple[str, str, str, str]:
+    values = (user_id, provider, external_issuer, external_subject)
+    if any(not isinstance(value, str) or not value.strip() for value in values):
+        raise ValueError(
+            'named sessions require non-empty string user_id, provider, '
+            'external_issuer, and external_subject'
+        )
+    user_id, provider, external_issuer, external_subject = (
+        value.strip() for value in values
+    )
+    if external_issuer != _canonical_external_issuer(provider):
+        raise ValueError('named session external issuer does not match provider policy')
+    if verify_owner:
+        from api.auth_users import find_user_by_identity
+
+        owner = find_user_by_identity(provider, external_issuer, external_subject)
+        if (
+            not isinstance(owner, dict)
+            or owner.get('id') != user_id
+            or owner.get('enabled') is not True
+        ):
+            raise ValueError('named session external identity is not owned by user')
+    return user_id, provider, external_issuer, external_subject
 
 
 def _prune_expired_sessions():
@@ -797,7 +907,223 @@ def get_session_info(cookie_value: str) -> dict | None:
     info.setdefault('auth_type', None)
     info.setdefault('username', None)
     info.setdefault('bound_profile', None)
+    info.setdefault('user_id', None)
+    info.setdefault('provider', None)
+    info.setdefault('external_issuer', None)
+    info.setdefault('external_subject', None)
+    if info.get('auth_type') == 'local':
+        info.setdefault('session_revocation_version', None)
     return info
+
+
+def current_session_info(handler) -> dict | None:
+    """Return verified server-side session metadata for this request, if any."""
+    cookie_value = parse_cookie(handler)
+    return get_session_info(cookie_value) if cookie_value else None
+
+
+def _has_named_session_marker(info: dict | None) -> bool:
+    """Return whether session metadata claims any part of a named identity.
+
+    Both fields being absent/null denotes a legacy generic session. Once either
+    field carries a value, validation must take the named-session path and fail
+    closed if the pair is incomplete or malformed.
+    """
+    return bool(info and any(
+        info.get(field) is not None
+        for field in ('user_id', 'provider', 'external_issuer', 'external_subject')
+    ))
+
+
+def current_principal(handler) -> dict | None:
+    """Resolve a named session's user from the authoritative store.
+
+    Resolution is cached only for one HTTP request. Legacy anonymous, password,
+    passkey, and trusted sessions intentionally return ``None``. A deleted,
+    disabled, malformed, or unreadable named user fails closed and invalidates
+    the session immediately.
+    """
+    info = current_session_info(handler)
+    if not _has_named_session_marker(info):
+        return None
+
+    user_id = info.get('user_id')
+    provider = info.get('provider')
+    external_issuer = info.get('external_issuer')
+    external_subject = info.get('external_subject')
+    token = info.get('token')
+    if getattr(handler, '_current_principal_session_token', None) == token:
+        return getattr(handler, '_current_principal', None)
+
+    principal = None
+    try:
+        from api.auth_users import get_user, permissions_for_role, user_allows_profile
+        user = get_user(user_id) if isinstance(user_id, str) else None
+        if info.get('auth_type') == 'local':
+            if not isinstance(user, dict) or user.get('enabled') is not True:
+                raise ValueError('local-session user is unavailable')
+            if info.get('session_revocation_version') != user.get('session_revocation_version'):
+                raise ValueError('local-session was revoked')
+            permissions_for_role(user.get('role'))
+            assigned = user.get('profiles')
+            if not isinstance(assigned, list) or any(
+                not isinstance(profile, str) or not user_allows_profile(user, profile)
+                for profile in assigned
+            ):
+                raise ValueError('local-session user has invalid profile assignments')
+            principal = dict(user)
+            principal['auth_type'] = 'local'
+            principal['username'] = info.get('username') or user.get('username')
+            handler._current_principal_session_token = token
+            handler._current_principal = principal
+            return principal
+
+        from api.auth_users import (
+            find_user_by_identity,
+            get_user,
+            permissions_for_role,
+            user_allows_profile,
+        )
+
+        user_id, provider, external_issuer, external_subject = (
+            _validate_named_external_identity(
+                user_id, provider, external_issuer, external_subject
+            )
+        )
+        user = get_user(user_id)
+        if not isinstance(user, dict) or user.get('id') != user_id or user.get('enabled') is not True:
+            raise ValueError('named-session user is unavailable')
+        identity = {
+            'provider': provider,
+            'issuer': external_issuer,
+            'subject': external_subject,
+        }
+        identities = user.get('identities')
+        if not isinstance(identities, list) or identity not in identities:
+            raise ValueError('named-session user no longer owns external identity')
+        owner = find_user_by_identity(provider, external_issuer, external_subject)
+        if (
+            not isinstance(owner, dict)
+            or owner.get('id') != user_id
+            or owner.get('enabled') is not True
+        ):
+            raise ValueError('named-session external identity lookup disagrees')
+        permissions_for_role(user.get('role'))
+        assigned = user.get('profiles')
+        if not isinstance(assigned, list) or any(
+            not isinstance(profile, str) or not user_allows_profile(user, profile)
+            for profile in assigned
+        ):
+            raise ValueError('named-session user has invalid profile assignments')
+        principal = dict(user)
+        principal['provider'] = provider
+        principal['external_issuer'] = external_issuer
+        principal['external_subject'] = external_subject
+        principal['auth_type'] = info.get('auth_type')
+        principal['username'] = info.get('username')
+    except Exception:
+        logger.warning('Named auth principal resolution failed; invalidating session', exc_info=True)
+        cookie_value = parse_cookie(handler)
+        if cookie_value:
+            invalidate_session(cookie_value)
+
+    handler._current_principal_session_token = token
+    handler._current_principal = principal
+    return principal
+
+
+def principal_has_permission(principal: dict | None, permission: str) -> bool:
+    """Pure permission check; malformed/absent inputs return ``False``."""
+    if (
+        not isinstance(principal, dict)
+        or principal.get('enabled') is not True
+        or not isinstance(permission, str)
+        or not permission
+    ):
+        return False
+    try:
+        from api.auth_users import permissions_for_role
+
+        return permission in permissions_for_role(principal.get('role'))
+    except (TypeError, ValueError):
+        return False
+
+
+def required_named_permission(method: str, path: str) -> str | None:
+    """Return the named-principal capability required by an HTTP route.
+
+    Query strings and trailing/repeated slashes are ignored. Prefixes match on
+    segment boundaries, so e.g. ``/api/administer`` is not administrative.
+    """
+    from urllib.parse import urlsplit
+
+    method = str(method or '').upper()
+    raw_path = urlsplit(str(path or '')).path or '/'
+    normalized = '/' + '/'.join(part for part in raw_path.split('/') if part)
+    if normalized != '/':
+        normalized = normalized.rstrip('/')
+
+    def under(prefix: str) -> bool:
+        return normalized == prefix or normalized.startswith(prefix + '/')
+
+    for prefix, permission in (
+        ('/api/admin', 'users:manage'),
+        ('/api/providers', 'providers:manage'),
+        ('/api/channels/matrix', 'channels:manage'),
+        ('/api/mcp/servers', 'mcp:manage'),
+    ):
+        if under(prefix):
+            return permission
+
+    all_method_exact = {
+        '/api/settings': 'settings:manage',
+        '/api/shutdown': 'system:manage',
+        '/api/health/restart': 'system:manage',
+        '/api/restart': 'system:manage',
+        '/api/dashboard/config': 'dashboard:manage',
+    }
+    if normalized in all_method_exact:
+        return all_method_exact[normalized]
+    if under('/api/onboarding/oauth'):
+        return 'onboarding:write'
+    if normalized in {
+        '/api/onboarding/setup', '/api/onboarding/complete', '/api/onboarding/probe'
+    }:
+        return 'onboarding:write'
+
+    if method in {'POST', 'PUT', 'PATCH', 'DELETE'}:
+        permission = {
+            '/api/default-model': 'models:write',
+            '/api/model/set': 'models:write',
+            '/api/reasoning': 'models:write',
+            '/api/profile/create': 'profiles:write',
+            '/api/profile/delete': 'profiles:write',
+            '/api/updates/apply': 'updates:write',
+            '/api/updates/force': 'updates:write',
+            '/api/updates/clear_lock': 'updates:write',
+            '/api/updates/clear-lock': 'updates:write',
+            '/api/onboarding/setup': 'onboarding:write',
+            '/api/onboarding/complete': 'onboarding:write',
+            '/api/onboarding/probe': 'onboarding:write',
+            '/api/gateway/start': 'gateway:manage',
+            '/api/gateway/stop': 'gateway:manage',
+            '/api/gateway/restart': 'gateway:manage',
+        }.get(normalized)
+        if permission:
+            return permission
+        if under('/api/auth/passkey') and normalized not in {
+            '/api/auth/passkey/options', '/api/auth/passkey/login'
+        }:
+            return 'passkeys:manage'
+        if normalized in {
+            '/api/extensions/install',
+            '/api/extensions/uninstall',
+            '/api/extensions/toggle',
+            '/api/extensions/consent',
+            '/api/extensions/sidecar-proxy-consent',
+        }:
+            return 'extensions:manage'
+    return None
 
 
 def session_bound_profile(cookie_value: str) -> str | None:
@@ -832,6 +1158,8 @@ def reset_trusted_auth_request_state(handler) -> None:
         '_trusted_auth_session_rejected',
         '_trusted_auth_session_info',
         '_trusted_auth_session_cookie_value',
+        '_current_principal_session_token',
+        '_current_principal',
         # Clear any auth cookie queued by a prior request but not yet flushed.
         # The handler is reused across HTTP/1.1 keep-alive requests, so a stale
         # queued Set-Cookie would otherwise cross the request boundary and be
@@ -903,6 +1231,41 @@ def trusted_session_allows_active_profile(info: dict | None) -> bool:
     if not info:
         return True
     return _request_profile_matches_bound(str(info.get('bound_profile') or '') or None)
+
+
+def _apply_named_principal_profile(handler, principal: dict, cookie_value: str) -> bool:
+    """Authorize and bind this request to a profile from the live principal."""
+    from api.auth_users import user_allows_profile
+    from api.helpers import get_profile_cookie
+    from api.profiles import set_request_profile
+
+    requested = get_profile_cookie(handler)
+    if requested:
+        if not user_allows_profile(principal, requested):
+            return False
+        selected = requested
+    elif principal.get('role') == 'admin':
+        # Never inherit process-global state when a named request omitted its
+        # cookie. Default is stable and every valid profile is admin-authorized.
+        selected = 'default'
+    else:
+        assigned = principal.get('profiles')
+        selected = next(
+            (profile for profile in assigned if user_allows_profile(principal, profile)),
+            None,
+        ) if isinstance(assigned, list) else None
+        if selected is None:
+            return False
+
+    set_request_profile(selected)
+    if requested != selected:
+        try:
+            _queue_pending_cookie(handler, _build_profile_cookie_header(selected, cookie_value))
+        except Exception:
+            # Request authorization/scoping is safe even if cookie persistence
+            # is unavailable; selection will be repeated on the next request.
+            logger.warning('Failed to queue named principal profile cookie', exc_info=True)
+    return True
 
 
 def _session_token_from_cookie_value(cookie_value: str) -> str | None:
@@ -1077,7 +1440,59 @@ def check_auth(handler, parsed) -> bool:
         handler.wfile.write(body)
         return False
     session_info = ensure_trusted_auth_session(handler)
-    if session_info:
+    named_session = _has_named_session_marker(session_info)
+    principal = current_principal(handler) if named_session else None
+    if named_session and principal is not None and cookie_val:
+        permission = required_named_permission(
+            getattr(handler, 'command', ''),
+            getattr(parsed, 'path', '') or getattr(handler, 'path', ''),
+        )
+        if permission and not (
+            principal_has_permission(principal, permission)
+            or principal_has_permission(principal, '*')
+        ):
+            body = b'{"error":"Forbidden"}'
+            handler.send_response(403)
+            handler.send_header('Content-Type', 'application/json')
+            handler.send_header('Content-Length', str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            return False
+        # Aggregate profile reads are administrator-only for named principals.
+        # Reject before profile selection so unauthorized aggregate requests
+        # cannot trigger profile side effects or be silently downgraded.
+        if principal.get('role') != 'admin':
+            import urllib.parse as _urlparse
+
+            all_profiles_values = _urlparse.parse_qs(
+                getattr(parsed, 'query', '') or '', keep_blank_values=True
+            ).get('all_profiles', [])
+            if any(
+                str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+                for value in all_profiles_values
+            ):
+                body = b'{"error":"Forbidden"}'
+                handler.send_response(403)
+                handler.send_header('Content-Type', 'application/json')
+                handler.send_header('Content-Length', str(len(body)))
+                handler.end_headers()
+                handler.wfile.write(body)
+                return False
+        if not _apply_named_principal_profile(handler, principal, cookie_val):
+            if parsed.path.startswith('/api/'):
+                body = b'{"error":"Profile access forbidden"}'
+                handler.send_response(403)
+                handler.send_header('Content-Type', 'application/json')
+            else:
+                body = b'Profile access forbidden'
+                handler.send_response(403)
+                handler.send_header('Content-Type', 'text/plain; charset=utf-8')
+            handler.send_header('Content-Length', str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            return False
+        return True
+    if session_info and not named_session:
         if not trusted_session_allows_active_profile(session_info):
             if parsed.path.startswith('/api/'):
                 body = b'{"error":"Profile access forbidden"}'

@@ -496,6 +496,44 @@ def _all_profiles_enabled(parsed_url) -> bool:
     return _all_profiles_query_flag(parsed_url) and not _is_isolated_profile_mode()
 
 
+def _stage_profile_grant_cleanup(profile_name: str):
+    from api.auth_users import remove_profile_assignments
+
+    return remove_profile_assignments(profile_name)
+
+
+def _restore_profile_grants(token) -> None:
+    from api.auth_users import restore_profile_assignments
+
+    restore_profile_assignments(token)
+
+
+def _delete_profile_filesystem(profile_name: str):
+    from api.profiles import delete_profile_api
+
+    return delete_profile_api(profile_name)
+
+
+def _delete_profile_with_grant_cleanup(profile_name: str):
+    """Stage durable grant cleanup before irreversible profile deletion."""
+    token = _stage_profile_grant_cleanup(profile_name)
+    try:
+        return _delete_profile_filesystem(profile_name)
+    except Exception as delete_error:
+        try:
+            _restore_profile_grants(token)
+        except Exception as rollback_error:
+            logger.exception(
+                "Profile deletion failed for %s and grant rollback also failed",
+                profile_name,
+            )
+            raise RuntimeError(
+                f"Profile deletion failed ({delete_error}); grant rollback failed "
+                f"({rollback_error})"
+            ) from delete_error
+        raise
+
+
 def _query_flag(parsed_url, name: str) -> bool:
     """Return True for a truthy query flag value."""
     qs = parse_qs(parsed_url.query)
@@ -5485,6 +5523,194 @@ def _check_csrf(handler) -> bool:
     return _set_csrf_failure_reason(handler, "token_mismatch")
 
 
+def _canonical_http_origin(value: str, *, allow_resource: bool) -> tuple[str, str, int] | None:
+    """Parse an HTTP(S) provenance value into its exact origin tuple."""
+    value = str(value or "").strip()
+    if not value or value.lower() == "null":
+        return None
+    if any(ord(char) < 0x20 or char in "\\\r\n\t" for char in value):
+        return None
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return None
+        if not parsed.netloc or parsed.username is not None or parsed.password is not None:
+            return None
+        if not allow_resource and (parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+            return None
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    if not hostname or any(char.isspace() for char in hostname) or "%" in hostname:
+        return None
+    try:
+        hostname = hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return None
+    if ":" in hostname:
+        import ipaddress
+
+        try:
+            if ipaddress.ip_address(hostname).version != 6:
+                return None
+        except ValueError:
+            return None
+    else:
+        labels = hostname[:-1].split(".") if hostname.endswith(".") else hostname.split(".")
+        if (
+            not labels
+            or any(
+                not label or len(label) > 63
+                or not _re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+                for label in labels
+            )
+        ):
+            return None
+    scheme = parsed.scheme.lower()
+    effective_port = port if port is not None else (443 if scheme == "https" else 80)
+    if not 1 <= effective_port <= 65535:
+        return None
+    return scheme, hostname, effective_port
+
+
+def _direct_request_is_secure(handler) -> bool:
+    """Use secure-context policy without accepting spoofed forwarded protocol."""
+    from api.auth import _is_secure_context
+
+    secure = _is_secure_context(handler)
+    forwarded = str(handler.headers.get("X-Forwarded-Proto") or "").strip()
+    if not forwarded or not _truthy_env("HERMES_WEBUI_TRUST_FORWARDED_PROTO"):
+        return secure
+    if _raw_peer_is_trusted_proxy(handler):
+        return secure
+    configured = os.getenv("HERMES_WEBUI_SECURE", "").strip().lower()
+    if configured in {"1", "true", "yes"}:
+        return True
+    if configured in {"0", "false", "no"}:
+        return False
+    request = getattr(handler, "request", None)
+    return getattr(request, "getpeercert", None) is not None
+
+
+def _named_admin_request_origin(handler) -> tuple[str, str, int] | None:
+    """Resolve the externally trusted request origin for privileged writes."""
+    trusted_proxy = _raw_peer_is_trusted_proxy(handler)
+    forwarded_proto = str(handler.headers.get("X-Forwarded-Proto") or "").strip().lower()
+    if _truthy_env("HERMES_WEBUI_TRUST_FORWARDED_PROTO") and trusted_proxy and forwarded_proto:
+        if forwarded_proto not in {"http", "https"}:
+            return None
+        scheme = forwarded_proto
+    else:
+        scheme = "https" if _direct_request_is_secure(handler) else "http"
+
+    host = str(handler.headers.get("Host") or "").strip()
+    if _truthy_env("HERMES_WEBUI_TRUST_FORWARDED_HOST") and trusted_proxy:
+        forwarded_host = str(
+            handler.headers.get("X-Forwarded-Host")
+            or handler.headers.get("X-Real-Host")
+            or ""
+        ).strip()
+        if forwarded_host:
+            host = forwarded_host
+    return _canonical_http_origin(f"{scheme}://{host}", allow_resource=False)
+
+
+def _check_named_admin_origin(handler) -> bool:
+    """Require Origin (preferred) or Referer to exactly match this server."""
+    _clear_csrf_failure_reason(handler)
+    origin = str(handler.headers.get("Origin") or "").strip()
+    referer = str(handler.headers.get("Referer") or "").strip()
+    if not origin and not referer:
+        return _set_csrf_failure_reason(handler, "origin_mismatch")
+    supplied = _canonical_http_origin(
+        origin or referer, allow_resource=not bool(origin)
+    )
+    expected = _named_admin_request_origin(handler)
+    if supplied is None or expected is None or supplied != expected:
+        return _set_csrf_failure_reason(handler, "origin_mismatch")
+    return True
+
+
+def _named_admin_principal(handler):
+    """Require a live named admin; legacy owner sessions are intentionally denied."""
+    from api.auth import current_principal
+
+    principal = current_principal(handler)
+    if (
+        not isinstance(principal, dict)
+        or principal.get("enabled") is not True
+        or principal.get("role") != "admin"
+        or not isinstance(principal.get("id"), str)
+        or not principal["id"]
+    ):
+        return None
+    return principal
+
+
+def _safe_auth_user(user: dict, *, provider: str | None = None) -> dict:
+    payload = {
+        "id": user.get("id"),
+        "display_name": user.get("display_name"),
+        "email": user.get("email"),
+        "role": user.get("role"),
+    }
+    if provider is not None:
+        payload["provider"] = provider
+    return payload
+
+
+def _safe_admin_user(user: dict) -> dict:
+    return {
+        "id": user.get("id"),
+        "display_name": user.get("display_name"),
+        "email": user.get("email"),
+        "role": user.get("role"),
+        "enabled": user.get("enabled"),
+        "profiles": list(user.get("profiles") or []),
+        "providers": sorted({
+            identity.get("provider")
+            for identity in user.get("identities", [])
+            if isinstance(identity, dict) and isinstance(identity.get("provider"), str)
+        }),
+        "created_at": user.get("created_at"),
+        "updated_at": user.get("updated_at"),
+    }
+
+
+def _admin_store_error(handler, exc: Exception):
+    from api.auth_users import AuthUserStoreError
+
+    if isinstance(exc, KeyError):
+        return bad(handler, "Not found", 404)
+    if isinstance(exc, AuthUserStoreError) or not isinstance(exc, ValueError):
+        logger.exception("Named-admin auth store operation failed")
+        return bad(handler, "Authentication store unavailable", 500)
+    message = str(exc).lower()
+    if any(marker in message for marker in ("last enabled admin", "duplicate", "already exists")):
+        return bad(handler, "Request conflicts with current authentication state", 409)
+    return bad(handler, "Invalid request", 400)
+
+
+def _handle_admin_invitation_create(handler, body):
+    principal = _named_admin_principal(handler)
+    if principal is None:
+        return bad(handler, "Forbidden", 403)
+    if not isinstance(body, dict) or set(body) != {"provider", "target", "profiles", "expires_at"}:
+        return bad(handler, "Invalid request", 400)
+    try:
+        from api.auth_users import create_invitation
+
+        invitation = create_invitation(
+            provider=body["provider"], target=body["target"],
+            profiles=body["profiles"], expires_at=body["expires_at"],
+            created_by=principal["id"],
+        )
+        return j(handler, {"invitation": invitation}, status=201)
+    except Exception as exc:
+        return _admin_store_error(handler, exc)
+
+
 _EXTENSION_SIDECAR_PROXY_RE = _re.compile(
     r"^/api/extensions/(?P<extension_id>[^/]+)/sidecar(?:/(?P<proxy_path>.*))?$"
 )
@@ -10102,6 +10328,7 @@ _LOGIN_PAGE_HTML = """<!doctype html>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#1a1a2e;color:#e8e8f0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
   height:100vh;display:flex;align-items:center;justify-content:center}
+[hidden]{display:none!important}
 .card{background:#16213e;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:36px 32px;
   width:320px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.3)}
 .logo{width:48px;height:48px;border-radius:12px;background:linear-gradient(145deg,#e8a030,#e94560);
@@ -10113,28 +10340,45 @@ input{width:100%;padding:10px 14px;border-radius:10px;border:1px solid rgba(255,
   background:rgba(255,255,255,.04);color:#e8e8f0;font-size:14px;outline:none;margin-bottom:14px;
   transition:border-color .15s}
 input:focus{border-color:rgba(124,185,255,.5);box-shadow:0 0 0 3px rgba(124,185,255,.1)}
+.visually-hidden{position:absolute!important;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip:rect(0,0,0,0);white-space:nowrap;border:0}
 button{width:100%;padding:10px;border-radius:10px;border:none;background:rgba(124,185,255,.15);
   border:1px solid rgba(124,185,255,.3);color:#7cb9ff;font-size:14px;font-weight:600;cursor:pointer;
   transition:all .15s}
 button:hover{background:rgba(124,185,255,.25)}
-.oidc-login{display:block;margin-top:10px;padding:10px;border-radius:10px;text-decoration:none;
+.provider-login{display:block;margin-top:10px;padding:10px;border-radius:10px;text-decoration:none;
   background:rgba(255,255,255,.04);border:1px solid rgba(111,214,164,.35);color:#6fd6a4;
   font-size:14px;font-weight:600;cursor:pointer;transition:all .15s}
-.oidc-login:hover{background:rgba(111,214,164,.12)}
+.provider-login:hover{background:rgba(111,214,164,.12)}
+.provider-login:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid #7cb9ff;outline-offset:2px}
+.google-login{border-color:rgba(124,185,255,.4);color:#7cb9ff}
+.github-login{border-color:rgba(232,232,240,.3);color:#e8e8f0}
 .passkey-login{margin-top:10px;background:rgba(255,255,255,.04);border-color:rgba(232,160,48,.35);color:#e8a030}
 .err{color:#e94560;font-size:12px;margin-top:10px;display:none}
+@media (prefers-color-scheme:light){
+  body{background:#f4eee7;color:#0a0908}.card{background:#fff;border-color:rgba(10,9,8,.12);box-shadow:0 8px 28px rgba(10,9,8,.12)}
+  .sub{color:#655f59}input{background:#f8f5f1;color:#0a0908;border-color:rgba(10,9,8,.18)}
+  .provider-login,.passkey-login{background:#f8f5f1}.github-login{color:#24292f;border-color:rgba(36,41,47,.3)}
+}
 </style></head><body>
 <div class="card">
   <div class="logo">{{BOT_NAME_INITIAL}}</div>
   <h1>{{BOT_NAME}}</h1>
-  <p class="sub">{{LOGIN_SUBTITLE}}</p>
-  <form id="login-form" data-invalid-pw="{{LOGIN_INVALID_PW}}" data-conn-failed="{{LOGIN_CONN_FAILED}}">
-    <input type="password" id="pw" placeholder="{{LOGIN_PLACEHOLDER}}" autofocus>
-    <button type="submit">{{LOGIN_BTN}}</button>
-    <button type="button" id="passkey-login" class="passkey-login" style="display:none">Sign in with passkey</button>
-    {{OIDC_LOGIN_HTML}}
-  </form>
-  <div class="err" id="err"></div>
+  <p class="sub"{{PASSWORD_SUBTITLE_HIDDEN}}>{{LOGIN_SUBTITLE}}</p>
+  <section id="password-login-section"{{PASSWORD_LOGIN_HIDDEN}}>
+    <form id="login-form" data-invalid-pw="{{LOGIN_INVALID_PW}}" data-conn-failed="{{LOGIN_CONN_FAILED}}">
+      <label class="visually-hidden" for="password">{{LOGIN_PLACEHOLDER}}</label>
+      <input type="password" id="password" placeholder="{{LOGIN_PLACEHOLDER}}" autocomplete="current-password"{{PASSWORD_AUTOFOCUS}}>
+      <button type="submit">{{LOGIN_BTN}}</button>
+    </form>
+  </section>
+  <button type="button" id="passkey-login" class="passkey-login"{{PASSKEY_LOGIN_HIDDEN}}>Sign in with passkey</button>
+  <div id="provider-login-section">
+    <a id="google-login" class="provider-login google-login"{{GOOGLE_LOGIN_HIDDEN}} href="{{GOOGLE_LOGIN_HREF}}">Continue with Google</a>
+    <a id="github-login" class="provider-login github-login"{{GITHUB_LOGIN_HIDDEN}} href="{{GITHUB_LOGIN_HREF}}">Continue with GitHub</a>
+    <a id="oidc-login" class="provider-login oidc-login"{{OIDC_LOGIN_HIDDEN}} href="{{OIDC_LOGIN_HREF}}">Continue with SSO</a>
+  </div>
+  <div class="err" id="err" role="alert" aria-live="polite"></div>
 </div>
 <!-- Keep login.js relative so subpath mounts load it under the current scope. -->
 <script src="static/login.js?v={{WEBUI_VERSION}}"></script>
@@ -10210,6 +10454,71 @@ def _oidc_login_html(parsed) -> str:
         '<a id="oidc-login" class="oidc-login" '
         f'href="{_html.escape(href, quote=True)}">Continue with SSO</a>'
     )
+
+
+def _login_provider_href(provider: str, next_path: str) -> str:
+    href = f"/api/auth/{provider}/start"
+    if next_path != "/":
+        href += "?next=" + quote(next_path, safe="/")
+    return _html.escape(href, quote=True)
+
+
+def _login_control_render_values(parsed) -> dict[str, str]:
+    """Resolve login capabilities once for safe server-rendered fallbacks."""
+    next_path = _safe_login_redirect_path(
+        parse_qs(parsed.query or "").get("next", [""])[0]
+    )
+    password_enabled = google_enabled = github_enabled = oidc_enabled = False
+    passkey_enabled = False
+    try:
+        from api.auth import get_password_hash
+
+        password_enabled = get_password_hash() is not None
+    except Exception:
+        pass
+    try:
+        from api.auth_oidc import is_google_enabled
+
+        google_enabled = is_google_enabled()
+    except Exception:
+        pass
+    try:
+        from api.auth_oidc import is_oidc_enabled
+
+        oidc_enabled = is_oidc_enabled()
+    except Exception:
+        pass
+    try:
+        from api.auth_github import is_github_enabled
+
+        github_enabled = is_github_enabled()
+    except Exception:
+        pass
+    try:
+        from api.auth import _passkey_feature_flag_enabled
+        from api.passkeys import registered_credentials
+
+        passkey_enabled = (
+            _passkey_feature_flag_enabled() and bool(registered_credentials())
+        )
+    except Exception:
+        pass
+
+    def hidden(enabled: bool) -> str:
+        return "" if enabled else " hidden"
+
+    return {
+        "{{PASSWORD_LOGIN_HIDDEN}}": hidden(password_enabled),
+        "{{PASSWORD_SUBTITLE_HIDDEN}}": hidden(password_enabled),
+        "{{PASSWORD_AUTOFOCUS}}": " autofocus" if password_enabled else "",
+        "{{PASSKEY_LOGIN_HIDDEN}}": hidden(passkey_enabled),
+        "{{GOOGLE_LOGIN_HIDDEN}}": hidden(google_enabled),
+        "{{GITHUB_LOGIN_HIDDEN}}": hidden(github_enabled),
+        "{{OIDC_LOGIN_HIDDEN}}": hidden(oidc_enabled),
+        "{{GOOGLE_LOGIN_HREF}}": _login_provider_href("google", next_path),
+        "{{GITHUB_LOGIN_HREF}}": _login_provider_href("github", next_path),
+        "{{OIDC_LOGIN_HREF}}": _login_provider_href("oidc", next_path),
+    }
 
 
 # ── Logs endpoint ─────────────────────────────────────────────────────────────
@@ -12013,6 +12322,16 @@ def _render_index_shell_base() -> str:
     return base
 
 
+def _redirect(handler, location: str) -> bool:
+    handler.send_response(302)
+    handler.send_header("Location", location)
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", "0")
+    _security_headers(handler)
+    handler.end_headers()
+    return True
+
+
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
     proxy_result = _handle_extension_sidecar_proxy(handler, parsed, "GET")
@@ -12034,6 +12353,45 @@ def handle_get(handler, parsed) -> bool:
     # See #2226.
     if parsed.path in ("/session/manifest.json", "/session/manifest.webmanifest"):
         return _serve_manifest(handler)
+
+    if parsed.path.startswith("/api/user/bots/"):
+        from api.auth import current_principal
+        principal = current_principal(handler)
+        if not isinstance(principal, dict) or not principal.get("id"):
+            return bad(handler, "Forbidden", 403)
+        bot_id = parsed.path[len("/api/user/bots/"):]
+        if not bot_id or "/" in bot_id:
+            return bad(handler, "Not found", 404)
+        from api.user_bots import get_bot
+        bot = get_bot(bot_id, principal["id"])
+        return j(handler, {"bot": bot}) if bot else bad(handler, "Not found", 404)
+
+    if parsed.path == "/api/user/bots":
+        from api.auth import current_principal
+        principal = current_principal(handler)
+        if not isinstance(principal, dict) or not principal.get("id"):
+            return bad(handler, "Forbidden", 403)
+        from api.user_bots import list_bots
+        return j(handler, {"bots": list_bots(principal["id"])})
+
+    if parsed.path == "/dashboard":
+        from api.auth import current_principal
+        principal = current_principal(handler)
+        if not isinstance(principal, dict) or principal.get("role") == "admin":
+            return _redirect(handler, "/")
+        dashboard_path = (Path(__file__).parent.parent / "static" / "member-dashboard.html").resolve()
+        html = dashboard_path.read_text(encoding="utf-8")
+        from api.auth import csrf_token_for_session, parse_cookie, verify_session
+        cookie_value = parse_cookie(handler)
+        csrf_token = csrf_token_for_session(cookie_value) if cookie_value and verify_session(cookie_value) else ""
+        html = html.replace("window.__CSRF_TOKEN__", json.dumps(csrf_token))
+        return t(handler, html, content_type="text/html; charset=utf-8")
+
+    if parsed.path in ("/", "/index.html"):
+        from api.auth import current_principal
+        principal = current_principal(handler)
+        if isinstance(principal, dict) and principal.get("role") != "admin":
+            return _redirect(handler, "/dashboard")
 
     if parsed.path in ("/", "/index.html") or parsed.path.startswith("/session/"):
         try:
@@ -12087,6 +12445,7 @@ def handle_get(handler, parsed) -> bool:
         from urllib.parse import quote
         from api.updates import WEBUI_VERSION
         version_token = quote(WEBUI_VERSION, safe="")
+        _login_controls = _login_control_render_values(parsed)
         _page = (
             _LOGIN_PAGE_HTML.replace("{{BOT_NAME}}", _bn)
             .replace("{{BOT_NAME_INITIAL}}", _bn[0].upper())
@@ -12102,8 +12461,9 @@ def handle_get(handler, parsed) -> bool:
             .replace(
                 "{{LOGIN_CONN_FAILED}}", _html.escape(_login_strings["conn_failed"])
             )
-            .replace("{{OIDC_LOGIN_HTML}}", _oidc_login_html(parsed))
         )
+        for _placeholder, _value in _login_controls.items():
+            _page = _page.replace(_placeholder, _value)
         return t(handler, _page, content_type="text/html; charset=utf-8")
 
     if parsed.path == "/api/auth/oidc/start":
@@ -12149,7 +12509,28 @@ def handle_get(handler, parsed) -> bool:
             return j(handler, {"error": str(exc)}, status=404)
         except OIDCAuthError as exc:
             return j(handler, {"error": str(exc)}, status=exc.status_code)
-        cookie_val = create_session()
+        if "user" not in result:
+            cookie_val = create_session()
+        else:
+            user = result.get("user")
+            if not isinstance(user, dict) or user.get("enabled") is not True or not user.get("id"):
+                message = (
+                    "OIDC identity is disabled"
+                    if isinstance(user, dict) and user.get("enabled") is not True
+                    else "OIDC identity is not admitted"
+                )
+                return j(handler, {"error": message}, status=403)
+            try:
+                cookie_val = create_session(
+                    user_id=str(user["id"]),
+                    provider="oidc",
+                    external_issuer=result.get("external_issuer"),
+                    external_subject=result.get("external_subject"),
+                    auth_type="oidc",
+                    username=str(user.get("display_name") or user.get("email") or ""),
+                )
+            except ValueError:
+                return j(handler, {"error": "OIDC identity is not admitted"}, status=403)
         handler.send_response(302)
         handler.send_header(
             "Location",
@@ -12162,45 +12543,347 @@ def handle_get(handler, parsed) -> bool:
         handler.end_headers()
         return True
 
+    if parsed.path == "/api/auth/google/start":
+        from api.auth import _is_secure_context
+        from api.auth_oidc import (
+            OIDCAuthError,
+            OIDCConfigError,
+            build_google_authorization_redirect,
+            google_flow_cookie_header,
+            google_flow_state_from_authorization_redirect,
+        )
+
+        next_path = _safe_login_redirect_path(
+            parse_qs(parsed.query or "").get("next", [""])[0]
+        )
+        try:
+            location = build_google_authorization_redirect(
+                _request_base_url(handler), next_path
+            )
+            flow_state = google_flow_state_from_authorization_redirect(location)
+            flow_cookie = google_flow_cookie_header(
+                flow_state, secure=_is_secure_context(handler)
+            )
+        except OIDCConfigError as exc:
+            return j(handler, {"error": str(exc)}, status=404)
+        except OIDCAuthError as exc:
+            return j(handler, {"error": str(exc)}, status=exc.status_code)
+        handler.send_response(302)
+        handler.send_header("Location", location)
+        handler.send_header("Cache-Control", "no-store")
+        # One narrowly scoped cookie intentionally makes the most recently started
+        # Google flow win when multiple tabs start login concurrently.
+        handler.send_header("Set-Cookie", flow_cookie)
+        handler.send_header("Content-Length", "0")
+        _security_headers(handler)
+        handler.end_headers()
+        return True
+
+    if parsed.path == "/api/auth/github/start":
+        from api.auth import _is_secure_context
+        from api.auth_github import (
+            GitHubAuthError,
+            GitHubConfigError,
+            build_authorization_redirect,
+            flow_cookie_header,
+            flow_state_from_authorization_redirect,
+        )
+
+        next_path = _safe_login_redirect_path(
+            parse_qs(parsed.query or "").get("next", [""])[0]
+        )
+        try:
+            location = build_authorization_redirect(
+                _request_base_url(handler), next_path
+            )
+            flow_state = flow_state_from_authorization_redirect(location)
+            flow_cookie = flow_cookie_header(
+                flow_state, secure=_is_secure_context(handler)
+            )
+        except GitHubConfigError as exc:
+            return j(handler, {"error": str(exc)}, status=404)
+        except GitHubAuthError as exc:
+            return j(handler, {"error": str(exc)}, status=exc.status_code)
+        handler.send_response(302)
+        handler.send_header("Location", location)
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Set-Cookie", flow_cookie)
+        handler.send_header("Content-Length", "0")
+        _security_headers(handler)
+        handler.end_headers()
+        return True
+
+    if parsed.path == "/api/auth/github/callback":
+        from api.auth import _is_secure_context, create_session, set_auth_cookie
+        from api.auth_github import (
+            GitHubAuthError,
+            GitHubConfigError,
+            complete_authorization_code_flow,
+            flow_cookie_header,
+            flow_cookie_matches,
+        )
+
+        clear_flow_cookie = flow_cookie_header(
+            secure=_is_secure_context(handler), clear=True
+        )
+
+        def github_callback_error(message, status):
+            return j(
+                handler,
+                {"error": message},
+                status=status,
+                extra_headers={"Set-Cookie": clear_flow_cookie},
+            )
+
+        query = parse_qs(parsed.query or "")
+        if str(query.get("error", [""])[0] or "").strip():
+            return github_callback_error("GitHub login failed", 401)
+        state = str(query.get("state", [""])[0] or "").strip()
+        code = str(query.get("code", [""])[0] or "").strip()
+        if not state or not code:
+            return github_callback_error(
+                "Missing GitHub callback state or code", 400
+            )
+        if not flow_cookie_matches(handler.headers.get("Cookie", ""), state):
+            return github_callback_error("Invalid GitHub login state", 401)
+        try:
+            result = complete_authorization_code_flow(
+                _request_base_url(handler), state, code
+            )
+        except GitHubConfigError as exc:
+            return github_callback_error(str(exc), 404)
+        except GitHubAuthError as exc:
+            return github_callback_error(str(exc), exc.status_code)
+        user = result.get("user")
+        if (
+            not isinstance(user, dict)
+            or user.get("enabled") is not True
+            or not user.get("id")
+        ):
+            return github_callback_error("GitHub identity is not admitted", 403)
+        try:
+            cookie_val = create_session(
+                user_id=str(user["id"]),
+                provider="github",
+                external_issuer=result.get("external_issuer"),
+                external_subject=result.get("external_subject"),
+                auth_type="oauth",
+                username=str(user.get("display_name") or ""),
+            )
+        except ValueError:
+            return github_callback_error("GitHub identity is not admitted", 403)
+        handler.send_response(302)
+        handler.send_header(
+            "Location", _safe_login_redirect_path(result.get("next_path"))
+        )
+        handler.send_header("Cache-Control", "no-store")
+        _security_headers(handler)
+        set_auth_cookie(handler, cookie_val)
+        handler.send_header("Set-Cookie", clear_flow_cookie)
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+        return True
+
+    if parsed.path == "/api/auth/google/callback":
+        from api.auth import _is_secure_context, create_session, set_auth_cookie
+        from api.auth_oidc import (
+            OIDCAuthError,
+            OIDCConfigError,
+            complete_google_authorization_code_flow,
+            google_flow_cookie_header,
+            google_flow_cookie_matches,
+        )
+
+        clear_flow_cookie = google_flow_cookie_header(
+            secure=_is_secure_context(handler), clear=True
+        )
+
+        def callback_error(message, status):
+            return j(
+                handler,
+                {"error": message},
+                status=status,
+                extra_headers={"Set-Cookie": clear_flow_cookie},
+            )
+
+        query = parse_qs(parsed.query or "")
+        error = str(query.get("error", [""])[0] or "").strip()
+        if error:
+            return callback_error("Google login failed", 401)
+        state = str(query.get("state", [""])[0] or "").strip()
+        code = str(query.get("code", [""])[0] or "").strip()
+        if not state or not code:
+            return callback_error("Missing Google callback state or code", 400)
+        if not google_flow_cookie_matches(handler.headers.get("Cookie", ""), state):
+            return callback_error("Invalid Google login state", 401)
+        try:
+            result = complete_google_authorization_code_flow(
+                _request_base_url(handler), state, code
+            )
+        except OIDCConfigError as exc:
+            return callback_error(str(exc), 404)
+        except OIDCAuthError as exc:
+            return callback_error(str(exc), exc.status_code)
+        user = result.get("user")
+        if not isinstance(user, dict) or user.get("enabled") is not True or not user.get("id"):
+            return callback_error("Google identity is not admitted", 403)
+        try:
+            cookie_val = create_session(
+                user_id=str(user["id"]),
+                provider="google",
+                external_issuer=result.get("external_issuer"),
+                external_subject=result.get("external_subject"),
+                auth_type="oidc",
+                username=str(user.get("display_name") or user.get("email") or ""),
+            )
+        except ValueError:
+            return callback_error("Google identity is not admitted", 403)
+        handler.send_response(302)
+        handler.send_header(
+            "Location", _safe_login_redirect_path(result.get("next_path"))
+        )
+        handler.send_header("Cache-Control", "no-store")
+        _security_headers(handler)
+        set_auth_cookie(handler, cookie_val)
+        handler.send_header("Set-Cookie", clear_flow_cookie)
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+        return True
+
     if parsed.path == "/api/auth/status":
         from api.auth import (
             _passkey_feature_flag_enabled,
             ensure_trusted_auth_session,
             get_password_hash,
-            is_auth_enabled,
             is_oidc_auth_enabled,
             is_trusted_auth_enabled,
         )
         from api.passkeys import registered_credentials
+        from api.auth_oidc import is_google_enabled
+        from api.auth_github import is_github_enabled
+
+        # Discover each capability in its own failure boundary. A broken provider
+        # configuration must hide only that provider and must never turn this
+        # public status endpoint into a 500 response.
+        def discover_bool(check):
+            try:
+                return bool(check()), True
+            except Exception:
+                return False, False
+
+        password_auth_enabled, password_known = discover_bool(
+            lambda: get_password_hash() is not None
+        )
+        oidc_enabled, _ = discover_bool(is_oidc_auth_enabled)
+        google_enabled, _ = discover_bool(is_google_enabled)
+        github_enabled, _ = discover_bool(is_github_enabled)
+        passkey_flag, passkey_flag_known = discover_bool(
+            _passkey_feature_flag_enabled
+        )
+        passkeys = []
+        passkeys_known = passkey_flag_known
+        if passkey_flag:
+            try:
+                passkeys = registered_credentials()
+                if not isinstance(passkeys, list):
+                    passkeys = []
+                    passkeys_known = False
+            except Exception:
+                passkeys = []
+                passkeys_known = False
+        trusted_auth_enabled, _ = discover_bool(is_trusted_auth_enabled)
+        auth_enabled = any((
+            password_auth_enabled,
+            oidc_enabled,
+            google_enabled,
+            github_enabled,
+            bool(passkeys),
+            trusted_auth_enabled,
+        ))
 
         logged_in = False
         session_info = None
-        auth_enabled = is_auth_enabled()
-        oidc_enabled = is_oidc_auth_enabled()
         if auth_enabled:
             session_info = ensure_trusted_auth_session(handler)
             logged_in = bool(session_info)
-        passkey_flag = _passkey_feature_flag_enabled()
-        passkeys = registered_credentials() if passkey_flag else []
-        password_auth_enabled = get_password_hash() is not None
+        passwordless_enabled = (
+            password_known
+            and passkeys_known
+            and bool(passkeys)
+            and not password_auth_enabled
+        )
         payload = {
             "auth_enabled": auth_enabled,
             "logged_in": logged_in,
             "oidc_enabled": oidc_enabled,
             "password_auth_enabled": password_auth_enabled,
-            "passwordless_enabled": bool(passkeys) and not password_auth_enabled,
+            "google_enabled": google_enabled,
+            "github_enabled": github_enabled,
+            "passwordless_enabled": passwordless_enabled,
             "passkeys_enabled": bool(passkeys),
             "passkeys_count": len(passkeys),
             "passkey_feature_flag": passkey_flag,
             "auth_disabled_acknowledged": bool(load_settings().get("auth_disabled_acknowledged")) if not auth_enabled else False,
         }
-        if is_trusted_auth_enabled() or (session_info and session_info.get("auth_type") == "trusted"):
+        if trusted_auth_enabled or (session_info and session_info.get("auth_type") == "trusted"):
             payload["trusted_auth_enabled"] = True
         if session_info and session_info.get("auth_type") == "trusted":
             payload["auth_type"] = session_info.get("auth_type")
             payload["user"] = session_info.get("username")
             payload["bound_profile"] = session_info.get("bound_profile")
         return j(handler, payload)
+
+    if parsed.path == "/api/auth/me":
+        from api.auth import current_principal, current_session_info, is_auth_enabled
+        from api.auth_users import permissions_for_role, user_allows_profile
+        from api.profiles import list_profiles_api
+
+        if not is_auth_enabled():
+            return j(handler, {
+                "authenticated": False, "mode": "open", "user": None,
+                "permissions": ["legacy-owner"], "profiles": None,
+                "active_profile": _get_active_profile_name(),
+            })
+        principal = current_principal(handler)
+        if principal is None:
+            return j(handler, {
+                "authenticated": True, "mode": "legacy", "user": None,
+                "permissions": ["legacy-owner"], "profiles": None,
+                "active_profile": _get_active_profile_name(),
+            })
+        session_info = current_session_info(handler) or {}
+        live_names = sorted({
+            row.get("name") for row in list_profiles_api(force_refresh=True)
+            if isinstance(row, dict) and isinstance(row.get("name"), str)
+            and row.get("visible", True) is not False
+            and user_allows_profile(principal, row["name"])
+        })
+        return j(handler, {
+            "authenticated": True,
+            "mode": "named",
+            "user": _safe_auth_user(principal, provider=session_info.get("provider")),
+            "permissions": sorted(permissions_for_role(principal["role"])),
+            "profiles": live_names,
+            "active_profile": _get_active_profile_name(),
+        })
+
+    if parsed.path == "/api/admin/users":
+        if _named_admin_principal(handler) is None:
+            return bad(handler, "Forbidden", 403)
+        try:
+            from api.auth_users import list_users
+            return j(handler, {"users": [_safe_admin_user(user) for user in list_users()]})
+        except Exception as exc:
+            return _admin_store_error(handler, exc)
+
+    if parsed.path == "/api/admin/invitations":
+        if _named_admin_principal(handler) is None:
+            return bad(handler, "Forbidden", 403)
+        try:
+            from api.auth_users import list_invitations
+            return j(handler, {"invitations": list_invitations()})
+        except Exception as exc:
+            return _admin_store_error(handler, exc)
 
     if parsed.path.startswith("/api/share/"):
         token = parsed.path[len("/api/share/"):].strip()
@@ -13688,10 +14371,20 @@ def handle_get(handler, parsed) -> bool:
     # ── Profile API (GET) ──
     if parsed.path == "/api/profiles":
         from api import profiles as profiles_api
+        from api.auth import current_principal
+        from api.auth_users import user_allows_profile
         diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
         try:
             diag.stage("list_profiles_api") if diag else None
             profiles_payload = profiles_api.list_profiles_api()
+            principal = current_principal(handler) if hasattr(handler, "headers") else None
+            if principal is not None and principal.get("role") != "admin":
+                # Never filter the shared cached list in place.
+                profiles_payload = [
+                    dict(profile)
+                    for profile in profiles_payload
+                    if user_allows_profile(principal, str(profile.get("name") or ""))
+                ]
             diag.stage("active_profile_lookup") if diag else None
             active = profiles_api.get_active_profile_name()
             diag.stage("isolated_mode_check") if diag else None
@@ -13953,6 +14646,77 @@ def handle_post(handler, parsed) -> bool:
         finally:
             if diag:
                 diag.finish()
+    if parsed.path == "/api/auth/bootstrap":
+        if not _check_named_admin_origin(handler):
+            return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        try:
+            body = read_body(handler)
+            allowed = {"username", "display_name", "password", "profiles"}
+            if not isinstance(body, dict) or set(body) != allowed:
+                return bad(handler, "Invalid request", 400)
+            from api.auth_users import bootstrap_local_admin_if_empty, hash_password
+            user = bootstrap_local_admin_if_empty(username=body["username"], display_name=body["display_name"], password_hash=hash_password(body["password"]), profiles=body["profiles"])
+            if user is None:
+                return bad(handler, "Bootstrap is no longer available", 409)
+            return j(handler, {"user": _safe_admin_user(user)}, status=201)
+        except ValueError as exc:
+            return bad(handler, str(exc), 400)
+        except Exception as exc:
+            return _admin_store_error(handler, exc)
+
+    if parsed.path == "/api/admin/invitations":
+        try:
+            if not _check_named_admin_origin(handler):
+                return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+            if _named_admin_principal(handler) is None:
+                return bad(handler, "Forbidden", 403)
+            try:
+                body = read_body(handler)
+            except ValueError:
+                return bad(handler, "Invalid request", 400)
+            return _handle_admin_invitation_create(handler, body)
+        finally:
+            if diag:
+                diag.finish()
+
+    _is_admin_password_route = (
+        parsed.path == "/api/admin/users"
+        or (parsed.path.startswith("/api/admin/users/") and parsed.path.endswith("/password"))
+    )
+    if _is_admin_password_route:
+        try:
+            if not _check_named_admin_origin(handler):
+                return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+            if _named_admin_principal(handler) is None:
+                return bad(handler, "Forbidden", 403)
+            try:
+                body = read_body(handler)
+            except ValueError:
+                return bad(handler, "Invalid request", 400)
+            if not isinstance(body, dict):
+                return bad(handler, "Invalid request", 400)
+            from api.auth_users import create_local_user, hash_password, reset_local_password
+            try:
+                if parsed.path == "/api/admin/users":
+                    allowed = {"username", "display_name", "password", "role", "email", "profiles"}
+                    if set(body) != allowed:
+                        return bad(handler, "Invalid request", 400)
+                    user = create_local_user(
+                        username=body["username"], display_name=body["display_name"],
+                        password_hash=hash_password(body["password"]), role=body["role"],
+                        email=body["email"], profiles=body["profiles"],
+                    )
+                    return j(handler, {"user": _safe_admin_user(user)}, status=201)
+                user_id = parsed.path[len("/api/admin/users/"):-len("/password")]
+                if set(body) != {"password"} or not user_id or "/" in user_id:
+                    return bad(handler, "Invalid request", 400)
+                user = reset_local_password(user_id, hash_password(body["password"]))
+                return j(handler, {"user": _safe_admin_user(user)})
+            except Exception as exc:
+                return _admin_store_error(handler, exc)
+        finally:
+            if diag:
+                diag.finish()
     # T1 deprecation alias for the legacy ack endpoint that the pre-rename
     # WebUI used to POST to after handling ``process_complete``. The new
     # canonical SSE event is ``bg_task_complete`` and the new ack endpoint
@@ -14043,6 +14807,23 @@ def handle_post(handler, parsed) -> bool:
         if diag:
             diag.finish()
         raise
+    if parsed.path in {
+        "/api/session/new",
+        "/api/projects/create",
+        "/api/goal",
+        "/api/chat/start",
+        "/api/crons/create",
+    }:
+        from api.auth import current_principal
+
+        principal = current_principal(handler)
+        if principal is not None:
+            active_profile = _get_active_profile_name()
+            requested_profile = str(body.get("profile") or "").strip()
+            if requested_profile and not _profiles_match(requested_profile, active_profile):
+                return bad(handler, "Profile access forbidden", 403)
+            # The request profile selected by check_auth is authoritative.
+            body["profile"] = active_profile
     if not _guard_request_session_visibility(handler, parsed, body=body, method="POST"):
         if diag:
             diag.finish()
@@ -15624,15 +16405,29 @@ def handle_post(handler, parsed) -> bool:
         name = body.get("name", "").strip()
         if not name:
             return bad(handler, "name is required")
+        from api.auth import (
+            _has_named_session_marker,
+            current_principal,
+            ensure_trusted_auth_session,
+        )
+
+        session_info = ensure_trusted_auth_session(handler)
+        if getattr(handler, '_trusted_auth_session_rejected', False):
+            return bad(handler, 'Authentication required', 401)
+        named_session = _has_named_session_marker(session_info)
+        principal = current_principal(handler)
+        if named_session and principal is None:
+            return bad(handler, 'Authentication required', 401)
+        if principal is not None:
+            from api.auth_users import user_allows_profile
+
+            if not user_allows_profile(principal, name):
+                return bad(handler, "Profile access forbidden", 403)
         try:
-            from api.auth import ensure_trusted_auth_session
             from api.profiles import switch_profile, _validate_profile_name
             from api.helpers import build_profile_cookie
             if name != 'default':
                 _validate_profile_name(name)
-            session_info = ensure_trusted_auth_session(handler)
-            if getattr(handler, '_trusted_auth_session_rejected', False):
-                return bad(handler, 'Authentication required', 401)
             bound_profile = str((session_info or {}).get("bound_profile") or "").strip() or None
             if bound_profile and name != bound_profile:
                 return bad(handler, "Profile is bound to the current session", 403)
@@ -15711,10 +16506,10 @@ def handle_post(handler, parsed) -> bool:
         if not name:
             return bad(handler, "name is required")
         try:
-            from api.profiles import delete_profile_api, _validate_profile_name
+            from api.profiles import _validate_profile_name
 
             _validate_profile_name(name)
-            result = delete_profile_api(name)
+            result = _delete_profile_with_grant_cleanup(name)
             return j(handler, result)
         except PermissionError as e:
             return bad(handler, _sanitize_error(e), 403)
@@ -16458,6 +17253,56 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/session/import_cli":
         return _handle_session_import_cli(handler, body)
 
+    # ── Member bot control plane (POST) ──
+    if parsed.path.startswith("/api/user/bots/") and parsed.path.endswith("/rename"):
+        if not _check_csrf(handler):
+            return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        from api.auth import current_principal
+        principal = current_principal(handler)
+        if not isinstance(principal, dict) or not principal.get("id") or not isinstance(body, dict) or set(body) != {"name"}:
+            return bad(handler, "Invalid request", 400)
+        bot_id = parsed.path[len("/api/user/bots/"):-len("/rename")]
+        try:
+            from api.user_bots import rename_bot
+            return j(handler, {"bot": rename_bot(bot_id, principal["id"], body["name"])})
+        except KeyError: return bad(handler, "Not found", 404)
+        except ValueError as exc: return bad(handler, str(exc), 400)
+
+    if (
+        parsed.path.startswith("/api/user/bots/")
+        and (parsed.path.endswith("/start") or parsed.path.endswith("/stop"))
+    ):
+        if not _check_csrf(handler):
+            return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        from api.auth import current_principal
+        principal = current_principal(handler)
+        if not isinstance(principal, dict) or not principal.get("id"):
+            return bad(handler, "Forbidden", 403)
+        bot_id = parsed.path[len("/api/user/bots/"):-len("/start" if parsed.path.endswith("/start") else "/stop")]
+        if not bot_id or "/" in bot_id or body not in ({}, None):
+            return bad(handler, "Invalid request", 400)
+        try:
+            from api.bot_runtime import start_bot, stop_bot
+            result = start_bot(principal["id"], bot_id) if parsed.path.endswith("/start") else stop_bot(principal["id"], bot_id)
+            return j(handler, {"bot": result})
+        except KeyError:
+            return bad(handler, "Not found", 404)
+        except (RuntimeError, ValueError) as exc:
+            return bad(handler, str(exc), 409)
+
+    if parsed.path == "/api/user/bots":
+        from api.auth import current_principal
+        principal = current_principal(handler)
+        if not isinstance(principal, dict) or not principal.get("id"):
+            return bad(handler, "Forbidden", 403)
+        if not isinstance(body, dict) or set(body) != {"name"}:
+            return bad(handler, "name is required", 400)
+        try:
+            from api.user_bots import create_bot
+            return j(handler, {"bot": create_bot(principal["id"], body["name"])}, status=201)
+        except (TypeError, ValueError) as exc:
+            return bad(handler, str(exc), 400)
+
     # ── Auth endpoints (POST) ──
     if parsed.path == "/api/auth/login":
         from api.auth import (
@@ -16477,13 +17322,43 @@ def handle_post(handler, parsed) -> bool:
                 {"error": "Too many attempts. Try again in a minute."},
                 status=429,
             )
+        username = body.get("username")
         password = body.get("password", "")
-        if not verify_password(password):
-            _record_login_attempt(client_ip)
-            return bad(handler, "Invalid password", 401)
-        _clear_login_attempts(client_ip)
-        cookie_val = create_session()
-        body = json.dumps({"ok": True}).encode()
+        local_user = None
+        if isinstance(username, str) and username.strip():
+            from api.auth_users import (
+                find_user_by_username,
+                record_login_failure,
+                record_login_success,
+                is_login_throttled,
+                verify_local_password,
+            )
+            local_user = find_user_by_username(username)
+            if (
+                not isinstance(local_user, dict)
+                or local_user.get("enabled") is not True
+                or is_login_throttled(local_user["id"])
+                or not verify_local_password(password, local_user.get("password_hash") or "")
+            ):
+                if isinstance(local_user, dict):
+                    record_login_failure(local_user["id"])
+                _record_login_attempt(client_ip)
+                return bad(handler, "Invalid username or password", 401)
+            record_login_success(local_user["id"])
+            _clear_login_attempts(client_ip)
+            cookie_val = create_session(
+                auth_type="local",
+                username=local_user["username"],
+                user_id=local_user["id"],
+                session_revocation_version=local_user.get("session_revocation_version", 0),
+            )
+        else:
+            if not verify_password(password):
+                _record_login_attempt(client_ip)
+                return bad(handler, "Invalid username or password", 401)
+            _clear_login_attempts(client_ip)
+            cookie_val = create_session()
+        body = json.dumps({"ok": True, "role": local_user.get("role") if local_user else None}).encode()
         handler.send_response(200)
         handler.send_header("Content-Type", "application/json")
         handler.send_header("Content-Length", str(len(body)))
@@ -16640,6 +17515,25 @@ def handle_post(handler, parsed) -> bool:
 
 def handle_patch(handler, parsed) -> bool:
     """Handle all PATCH routes. Returns True if handled, False for 404."""
+    match = _re.fullmatch(r"/api/admin/users/([^/]+)", parsed.path)
+    if match:
+        if not _check_named_admin_origin(handler):
+            return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        if _named_admin_principal(handler) is None:
+            return bad(handler, "Forbidden", 403)
+        try:
+            body = read_body(handler)
+        except ValueError:
+            return bad(handler, "Invalid request", 400)
+        allowed = {"display_name", "role", "enabled", "profiles"}
+        if not isinstance(body, dict) or not body or not set(body) <= allowed:
+            return bad(handler, "Invalid request", 400)
+        try:
+            from api.auth_users import update_user
+            updated = update_user(match.group(1), body)
+            return j(handler, {"user": _safe_admin_user(updated)})
+        except Exception as exc:
+            return _admin_store_error(handler, exc)
     if not _check_csrf(handler):
         return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
     proxy_result = _handle_extension_sidecar_proxy(
@@ -16668,6 +17562,35 @@ def handle_patch(handler, parsed) -> bool:
 
 def handle_delete(handler, parsed) -> bool:
     """Handle all DELETE routes. Returns True if handled, False for 404."""
+    match = _re.fullmatch(r"/api/user/bots/([^/]+)", parsed.path)
+    if match:
+        from api.auth import current_principal
+        principal = current_principal(handler)
+        if not isinstance(principal, dict) or not principal.get("id"):
+            return bad(handler, "Forbidden", 403)
+        try:
+            from api.bot_runtime import stop_bot
+            from api.user_bots import delete_bot
+            try: stop_bot(principal["id"], match.group(1))
+            except KeyError: pass
+            delete_bot(match.group(1), principal["id"])
+            return j(handler, {"ok": True})
+        except KeyError: return bad(handler, "Not found", 404)
+        except ValueError as exc: return bad(handler, str(exc), 400)
+
+    match = _re.fullmatch(r"/api/admin/invitations/([^/]+)", parsed.path)
+    if match:
+        if not _check_named_admin_origin(handler):
+            return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        if _named_admin_principal(handler) is None:
+            return bad(handler, "Forbidden", 403)
+        try:
+            from api.auth_users import revoke_invitation
+            if not revoke_invitation(match.group(1)):
+                return bad(handler, "Not found", 404)
+            return j(handler, {"ok": True})
+        except Exception as exc:
+            return _admin_store_error(handler, exc)
     if not _check_csrf(handler):
         return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
     proxy_result = _handle_extension_sidecar_proxy(
@@ -25940,6 +26863,22 @@ def _handle_session_import_cli(handler, body):
     if requested_profile == "":
         return bad(handler, "invalid profile", 400)
     allow_all_profiles = _request_wants_all_profiles_import(body)
+    from api import auth as auth_api
+
+    principal = auth_api.current_principal(handler) if hasattr(handler, "headers") else None
+    if (
+        isinstance(principal, dict)
+        and principal.get("enabled") is True
+        and principal.get("role") != "admin"
+    ):
+        # Authentication's active profile is authoritative for named members.
+        # Enforce this before reading existing sidecars or foreign CLI metadata.
+        active_profile = _normalize_import_profile_value(_get_active_profile_name())
+        if allow_all_profiles:
+            return bad(handler, "Forbidden", 403)
+        if requested_profile and not _profiles_match(requested_profile, active_profile):
+            return bad(handler, "Profile access forbidden", 403)
+        requested_profile = active_profile
     if allow_all_profiles and _is_isolated_profile_mode():
         return bad(handler, "all_profiles import is not allowed in isolated profile mode", 403)
     if allow_all_profiles and not requested_profile:
