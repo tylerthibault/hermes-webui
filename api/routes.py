@@ -5616,7 +5616,7 @@ def _named_admin_request_origin(handler) -> tuple[str, str, int] | None:
     return _canonical_http_origin(f"{scheme}://{host}", allow_resource=False)
 
 
-def _check_named_admin_origin(handler) -> bool:
+def _check_named_admin_origin(handler, *, allow_public_allowlist: bool = False) -> bool:
     """Require Origin (preferred) or Referer to exactly match this server."""
     _clear_csrf_failure_reason(handler)
     origin = str(handler.headers.get("Origin") or "").strip()
@@ -5626,8 +5626,18 @@ def _check_named_admin_origin(handler) -> bool:
     supplied = _canonical_http_origin(
         origin or referer, allow_resource=not bool(origin)
     )
+    if supplied is None:
+        return _set_csrf_failure_reason(handler, "origin_mismatch")
+    if allow_public_allowlist:
+        allowed_origins = {
+            parsed
+            for value in _allowed_public_origins()
+            if (parsed := _canonical_http_origin(value, allow_resource=False)) is not None
+        }
+        if supplied in allowed_origins:
+            return True
     expected = _named_admin_request_origin(handler)
-    if supplied is None or expected is None or supplied != expected:
+    if expected is None or supplied != expected:
         return _set_csrf_failure_reason(handler, "origin_mismatch")
     return True
 
@@ -14705,7 +14715,7 @@ def handle_post(handler, parsed) -> bool:
             if diag:
                 diag.finish()
     if parsed.path == "/api/auth/bootstrap":
-        if not _check_named_admin_origin(handler):
+        if not _check_named_admin_origin(handler, allow_public_allowlist=True):
             return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
         from api.auth import current_session_info
         from api.auth_users import has_local_users
