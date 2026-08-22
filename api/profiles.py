@@ -2039,7 +2039,7 @@ def _build_profile_rows_fast() -> list | None:
     return rows
 
 
-def list_profiles_api() -> list:
+def list_profiles_api(*, force_refresh: bool = False) -> list:
     """List all profiles with metadata, serialized for JSON response.
 
     In isolated profile mode (HERMES_HOME points to ~/.hermes/profiles/<name>),
@@ -2049,8 +2049,9 @@ def list_profiles_api() -> list:
     ``find_alias_for_profile`` (whose result the WebUI discards) — see
     ``_build_profile_rows_fast``. Results are cached for a short TTL so rapid
     re-opens of the compose-footer dropdown are free; the cache is busted on
-    profile create/delete. Falls back to upstream ``list_profiles()`` if the
-    cheap helpers are unavailable.
+    profile create/delete. ``force_refresh=True`` bypasses the TTL cache for
+    callers making authorization/lifecycle decisions. Falls back to upstream
+    ``list_profiles()`` if the cheap helpers are unavailable.
     """
     import time
     global _LIST_PROFILES_CACHE
@@ -2114,7 +2115,11 @@ def list_profiles_api() -> list:
     # acquired AFTER this lock (never the reverse), so there is no deadlock.
     with _LIST_PROFILES_CACHE_LOCK:
         cached = _LIST_PROFILES_CACHE
-        if cached is not None and now - cached[1] < _LIST_PROFILES_CACHE_TTL:
+        if (
+            not force_refresh
+            and cached is not None
+            and now - cached[1] < _LIST_PROFILES_CACHE_TTL
+        ):
             rows = cached[0]
         else:
             rows = _build_profile_rows_fast()
@@ -2156,6 +2161,61 @@ def list_profiles_api() -> list:
 
     active = get_active_profile_name()
     return [{**p, 'is_active': p['name'] == active} for p in rows]
+
+
+def profiles_exist_uncached(profile_ids: list[str]) -> bool:
+    """Confirm profile IDs directly against current profile directories.
+
+    Named profiles are checked at their authoritative ``profiles/<id>`` paths,
+    bypassing ``list_profiles_api`` and its TTL cache. The legacy ``default``
+    alias resolves to the base home. Only a possible renamed-root display name
+    needs a freshly rebuilt inventory, whose default row must resolve back to
+    that same base directory. Any lookup uncertainty fails closed.
+    """
+    if not isinstance(profile_ids, list) or any(
+        not isinstance(profile_id, str)
+        or (profile_id != 'default' and not _PROFILE_ID_RE.fullmatch(profile_id))
+        for profile_id in profile_ids
+    ):
+        return False
+    try:
+        if _is_isolated_profile_mode():
+            isolated_name = _isolated_profile_name()
+            isolated_home = Path(_INITIAL_HERMES_HOME).expanduser()
+            return isolated_home.is_dir() and all(
+                profile_id == isolated_name for profile_id in profile_ids
+            )
+
+        base_home = _DEFAULT_HERMES_HOME.expanduser()
+        unresolved: list[str] = []
+        for profile_id in profile_ids:
+            if profile_id == 'default':
+                if not base_home.is_dir():
+                    return False
+            elif (base_home / 'profiles' / profile_id).is_dir():
+                continue
+            else:
+                unresolved.append(profile_id)
+        if not unresolved:
+            return True
+
+        # Root display aliases do not have a profiles/<name> directory. Refresh
+        # only for that exceptional case, and verify the reported path itself.
+        rows = list_profiles_api(force_refresh=True)
+        root_aliases = {
+            row.get('name')
+            for row in rows
+            if isinstance(row, dict)
+            and row.get('is_default') is True
+            and isinstance(row.get('name'), str)
+            and isinstance(row.get('path'), str)
+            and Path(row['path']).expanduser().resolve() == base_home.resolve()
+            and Path(row['path']).expanduser().is_dir()
+        }
+        return all(profile_id in root_aliases for profile_id in unresolved)
+    except Exception:
+        logger.warning("Could not refresh profile inventory", exc_info=True)
+        return False
 
 
 def _profile_visible_from_meta(profile_path: Path) -> bool:

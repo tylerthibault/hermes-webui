@@ -340,11 +340,12 @@ def test_auth_status_reports_passkey_availability_source_contract():
     assert 'registered_credentials()' in src
 
 
-def test_login_page_has_default_hidden_passkey_button_and_script_wiring():
+def test_login_page_server_decides_passkey_fallback_and_script_wiring():
     routes = open("api/routes.py", encoding="utf-8").read()
     login_js = open("static/login.js", encoding="utf-8").read()
     assert 'id="passkey-login"' in routes
-    assert 'style="display:none"' in routes
+    assert "{{PASSKEY_LOGIN_HIDDEN}}" in routes
+    assert "_passkey_feature_flag_enabled() and bool(registered_credentials())" in routes
     assert "api/auth/passkey/options" in login_js
     assert "navigator.credentials.get" in login_js
 

@@ -770,6 +770,70 @@ def test_consumers_route_through_auth_owner(monkeypatch):
     assert handler.status == 200
 
 
+def test_check_auth_reconciles_before_named_session_classification(monkeypatch):
+    """Trusted reconciliation owns metadata before named RBAC classification."""
+    _trusted_env(monkeypatch)
+    handler = _Handler(headers={"Cookie": "hermes_session=stale.cookie"})
+    calls = []
+
+    monkeypatch.setattr(auth, "is_auth_enabled", lambda: True)
+    monkeypatch.setattr(auth, "parse_cookie", lambda _handler: "stale.cookie")
+    monkeypatch.setattr(auth, "verify_session", lambda _cookie: True)
+    monkeypatch.setattr(
+        auth,
+        "get_session_info",
+        lambda _cookie: (_ for _ in ()).throw(
+            AssertionError("check_auth classified unreconciled session metadata")
+        ),
+    )
+    monkeypatch.setattr(
+        auth,
+        "ensure_trusted_auth_session",
+        lambda _handler: calls.append("ensure") or {
+            "auth_type": "trusted",
+            "username": "bob",
+            "bound_profile": None,
+        },
+    )
+    monkeypatch.setattr(
+        auth,
+        "current_principal",
+        lambda _handler: (_ for _ in ()).throw(
+            AssertionError("reconciled trusted metadata is not a named session")
+        ),
+    )
+
+    assert auth.check_auth(handler, SimpleNamespace(path="/api/sessions", query="")) is True
+    assert calls == ["ensure"]
+
+
+def test_check_auth_logout_valid_session_shortcuts_before_reconciliation(monkeypatch):
+    """Logout must validate CSRF against the request's pre-rotation identity."""
+    handler = _Handler(headers={"Cookie": "hermes_session=old.cookie"})
+    handler.command = "POST"
+    monkeypatch.setattr(auth, "is_auth_enabled", lambda: True)
+    monkeypatch.setattr(auth, "parse_cookie", lambda _handler: "old.cookie")
+    monkeypatch.setattr(auth, "verify_session", lambda _cookie: True)
+    monkeypatch.setattr(
+        auth,
+        "ensure_trusted_auth_session",
+        lambda _handler: (_ for _ in ()).throw(
+            AssertionError("logout identity rotated before CSRF validation")
+        ),
+    )
+    monkeypatch.setattr(
+        auth,
+        "get_session_info",
+        lambda _cookie: (_ for _ in ()).throw(
+            AssertionError("logout classified metadata before its session shortcut")
+        ),
+    )
+
+    assert auth.check_auth(
+        handler, SimpleNamespace(path="/api/auth/logout", query="")
+    ) is True
+
+
 def test_sign_out_uses_trusted_logout_url_with_login_fallback():
     sign_out = extract_function(PANELS_JS, "signOut", prefix="async function")
 

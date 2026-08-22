@@ -196,6 +196,96 @@ def test_oidc_callback_rejects_allowlist_failure_without_setting_session_cookie(
     assert handler.header_values("Set-Cookie") == []
 
 
+def test_generic_oidc_module_rejects_disabled_mapped_identity(monkeypatch):
+    import api.auth_oidc as auth_oidc
+
+    issuer = "https://issuer.example"
+    monkeypatch.setattr(
+        auth_oidc,
+        "_require_provider_config",
+        lambda provider: {
+            "issuer": issuer,
+            "client_id": "webui-client",
+            "client_secret": "",
+            "redirect_uri": "",
+            "scopes": ["openid"],
+            "allow_claim": "email",
+            "allow_values": ["disabled@example.com"],
+        },
+    )
+    monkeypatch.setattr(
+        auth_oidc,
+        "_get_discovery_document",
+        lambda _issuer: {
+            "issuer": issuer,
+            "token_endpoint": f"{issuer}/token",
+            "jwks_uri": f"{issuer}/jwks",
+        },
+    )
+    monkeypatch.setattr(auth_oidc, "_post_form_json", lambda *_args: {"id_token": "token"})
+    monkeypatch.setattr(
+        auth_oidc,
+        "_validate_id_token",
+        lambda *_args, **_kwargs: {
+            "sub": "disabled-subject",
+            "email": "disabled@example.com",
+        },
+    )
+    monkeypatch.setattr(
+        auth_oidc.auth_users,
+        "find_user_by_identity",
+        lambda *_args: {"id": "disabled-user", "enabled": False},
+    )
+    auth_oidc._pending_flows.clear()
+    auth_oidc._pending_flows["state-token"] = {
+        "created_at": time.time(),
+        "provider": "oidc",
+        "nonce": "nonce-token",
+        "code_verifier": "verifier",
+        "next_path": "/",
+    }
+
+    with pytest.raises(auth_oidc.OIDCAuthError, match="disabled") as exc:
+        auth_oidc.complete_authorization_code_flow(
+            "http://localhost:8787", "state-token", "code-token"
+        )
+
+    assert exc.value.status_code == 403
+
+
+def test_oidc_callback_rejects_disabled_user_without_creating_legacy_session(monkeypatch):
+    import api.auth as auth
+    import api.routes as routes
+
+    monkeypatch.setattr(
+        "api.auth_oidc.complete_authorization_code_flow",
+        lambda *_args: {
+            "next_path": "/",
+            "user": {"id": "disabled-user", "enabled": False},
+        },
+    )
+    monkeypatch.setattr(
+        auth,
+        "create_session",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled identity must not create a session")
+        ),
+    )
+
+    handler = RouteFakeHandler()
+    routes.handle_get(
+        handler,
+        SimpleNamespace(
+            path="/api/auth/oidc/callback",
+            query="state=state-token&code=code-token",
+        ),
+    )
+
+    assert handler.status == 403
+    assert handler.json_body()["error"] == "OIDC identity is disabled"
+    assert handler.header_values("Set-Cookie") == []
+
+
 def test_auth_status_reports_oidc_capability_without_regressing_passkey_fields(monkeypatch):
     import api.auth as auth
     import api.passkeys as passkeys
@@ -222,6 +312,8 @@ def test_auth_status_reports_oidc_capability_without_regressing_passkey_fields(m
         "logged_in": False,
         "oidc_enabled": True,
         "password_auth_enabled": False,
+        "google_enabled": False,
+        "github_enabled": False,
         "passwordless_enabled": False,
         "passkeys_enabled": False,
         "passkeys_count": 0,
@@ -469,7 +561,7 @@ def test_validate_id_token_refetches_jwks_once_on_key_miss(monkeypatch):
     assert claims["sub"] == "user-123"
     assert fetches == [jwks_uri]
 
-def test_pending_oidc_flows_are_bounded(monkeypatch):
+def test_full_pending_oidc_capacity_rejects_new_flow_without_evicting_active_states(monkeypatch):
     import api.auth_oidc as auth_oidc
 
     monkeypatch.setattr(auth_oidc, "_MAX_PENDING_FLOWS", 2)
@@ -477,9 +569,134 @@ def test_pending_oidc_flows_are_bounded(monkeypatch):
     now = time.time()
     auth_oidc._store_pending_flow("old", {"created_at": now - 2, "nonce": "old"})
     auth_oidc._store_pending_flow("middle", {"created_at": now - 1, "nonce": "middle"})
-    auth_oidc._store_pending_flow("new", {"created_at": now, "nonce": "new"})
+    with pytest.raises(auth_oidc.OIDCAuthError) as exc:
+        auth_oidc._store_pending_flow("new", {"created_at": now, "nonce": "new"})
 
-    assert set(auth_oidc._pending_flows) == {"middle", "new"}
+    assert exc.value.status_code == 429
+    assert set(auth_oidc._pending_flows) == {"old", "middle"}
+    assert auth_oidc._consume_pending_flow("old")["nonce"] == "old"
+    assert auth_oidc._consume_pending_flow("middle")["nonce"] == "middle"
+
+
+def test_duplicate_oidc_state_cannot_replace_an_active_flow():
+    import api.auth_oidc as auth_oidc
+
+    auth_oidc._pending_flows.clear()
+    created_at = time.time()
+    auth_oidc._store_pending_flow(
+        "same", {"created_at": created_at, "nonce": "original"}
+    )
+
+    with pytest.raises(auth_oidc.OIDCAuthError) as exc:
+        auth_oidc._store_pending_flow(
+            "same", {"created_at": created_at + 1, "nonce": "replacement"}
+        )
+
+    assert exc.value.status_code == 503
+    assert auth_oidc._consume_pending_flow("same")["nonce"] == "original"
+
+
+def test_consumed_pending_oidc_flow_frees_capacity(monkeypatch):
+    import api.auth_oidc as auth_oidc
+
+    monkeypatch.setattr(auth_oidc, "_MAX_PENDING_FLOWS", 1)
+    auth_oidc._pending_flows.clear()
+    auth_oidc._store_pending_flow(
+        "first", {"created_at": time.time(), "nonce": "first"}
+    )
+
+    assert auth_oidc._consume_pending_flow("first")["nonce"] == "first"
+    auth_oidc._store_pending_flow(
+        "second", {"created_at": time.time(), "nonce": "second"}
+    )
+
+    assert set(auth_oidc._pending_flows) == {"second"}
+
+
+def test_concurrent_oidc_starts_never_exceed_capacity(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import api.auth_oidc as auth_oidc
+
+    monkeypatch.setattr(auth_oidc, "_MAX_PENDING_FLOWS", 2)
+    auth_oidc._pending_flows.clear()
+    now = time.time()
+
+    def reserve(index):
+        try:
+            auth_oidc._store_pending_flow(
+                f"state-{index}", {"created_at": now, "nonce": str(index)}
+            )
+            return True
+        except auth_oidc.OIDCAuthError as exc:
+            assert exc.status_code == 429
+            return False
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(reserve, range(8)))
+
+    assert results.count(True) == 2
+    assert len(auth_oidc._pending_flows) == 2
+
+
+def test_expired_pending_oidc_flow_frees_capacity(monkeypatch):
+    import api.auth_oidc as auth_oidc
+
+    monkeypatch.setattr(auth_oidc, "_MAX_PENDING_FLOWS", 1)
+    auth_oidc._pending_flows.clear()
+    auth_oidc._pending_flows["expired"] = {
+        "created_at": time.time() - auth_oidc._PENDING_TTL_SECONDS - 1,
+        "nonce": "expired",
+    }
+
+    auth_oidc._store_pending_flow(
+        "new", {"created_at": time.time(), "nonce": "new"}
+    )
+
+    assert set(auth_oidc._pending_flows) == {"new"}
+
+
+def test_oidc_start_capacity_error_is_safe_json_without_cookie(monkeypatch):
+    import api.auth_oidc as auth_oidc
+    import api.routes as routes
+
+    monkeypatch.setattr(auth_oidc, "_MAX_PENDING_FLOWS", 1)
+    monkeypatch.setattr(
+        auth_oidc,
+        "_require_provider_config",
+        lambda _provider: {
+            "issuer": "https://issuer.example",
+            "client_id": "client-id",
+            "redirect_uri": "",
+            "scopes": ["openid"],
+        },
+    )
+    monkeypatch.setattr(
+        auth_oidc,
+        "_get_discovery_document",
+        lambda _issuer: {
+            "issuer": "https://issuer.example",
+            "authorization_endpoint": "https://issuer.example/authorize",
+        },
+    )
+    auth_oidc._pending_flows.clear()
+    auth_oidc._store_pending_flow(
+        "active", {"created_at": time.time(), "nonce": "active"}
+    )
+
+    handler = RouteFakeHandler()
+    routes.handle_get(
+        handler,
+        SimpleNamespace(path="/api/auth/oidc/start", query="next=%2Fchat"),
+    )
+
+    assert handler.status == 429
+    assert handler.json_body() == {
+        "error": "Too many authentication flows are already pending"
+    }
+    assert handler.header_values("Location") == []
+    assert handler.header_values("Set-Cookie") == []
+    assert auth_oidc._consume_pending_flow("active")["nonce"] == "active"
 
 
 @pytest.mark.parametrize(

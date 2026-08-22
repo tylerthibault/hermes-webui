@@ -1,6 +1,8 @@
 import copy
 import base64
 import hashlib
+import hmac
+import http.cookies
 import ipaddress
 import json
 import logging
@@ -19,11 +21,18 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa, utils
 
+from api import auth_users
 from api.config import get_config
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_SCOPES = ("openid", "profile", "email")
+_GOOGLE_ISSUER = "https://accounts.google.com"
+GOOGLE_FLOW_COOKIE_NAME = "hermes_google_oidc_flow"
+GOOGLE_CALLBACK_PATH = "/api/auth/google/callback"
+_STATE_COOKIE_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
 _PENDING_TTL_SECONDS = 600
 _MAX_PENDING_FLOWS = 128
 _CLOCK_SKEW_SECONDS = 60
@@ -64,16 +73,79 @@ def is_oidc_enabled() -> bool:
     )
 
 
+def is_google_enabled() -> bool:
+    """Return whether the fixed Google OIDC provider has a client configured."""
+    return bool(_resolve_google_config().get("client_id"))
+
+
 def build_authorization_redirect(
     request_base_url: str,
     next_path: str | None = None,
 ) -> str:
-    cfg = _require_oidc_config()
+    """Build the legacy generic OIDC redirect (signature kept for compatibility)."""
+    return _build_authorization_redirect("oidc", request_base_url, next_path)
+
+
+def build_google_authorization_redirect(
+    request_base_url: str,
+    next_path: str | None = None,
+) -> str:
+    return _build_authorization_redirect("google", request_base_url, next_path)
+
+
+def google_flow_state_from_authorization_redirect(location: str) -> str:
+    """Extract the state generated for a Google authorization redirect."""
+    states = urllib.parse.parse_qs(urllib.parse.urlparse(location).query).get("state", [])
+    if len(states) != 1 or not states[0]:
+        raise OIDCAuthError(
+            "Google authorization redirect did not include state", status_code=502
+        )
+    return states[0]
+
+
+def google_flow_cookie_header(
+    state: str = "", *, secure: bool = False, clear: bool = False
+) -> str:
+    """Build the short-lived browser binding cookie for a Google login flow."""
+    if not clear and (not state or any(ch not in _STATE_COOKIE_CHARS for ch in state)):
+        raise OIDCAuthError("Google authorization state was invalid", status_code=502)
+    max_age = 0 if clear else _PENDING_TTL_SECONDS
+    header = (
+        f"{GOOGLE_FLOW_COOKIE_NAME}={state}; Path={GOOGLE_CALLBACK_PATH}; "
+        f"Max-Age={max_age}; HttpOnly; SameSite=Lax"
+    )
+    if secure:
+        header += "; Secure"
+    return header
+
+
+def google_flow_cookie_matches(cookie_header: str, callback_state: str) -> bool:
+    """Constant-time check that callback state belongs to the initiating browser."""
+    if not cookie_header or not callback_state:
+        return False
+    cookies = http.cookies.SimpleCookie()
+    try:
+        cookies.load(cookie_header)
+    except http.cookies.CookieError:
+        return False
+    morsel = cookies.get(GOOGLE_FLOW_COOKIE_NAME)
+    return bool(morsel) and hmac.compare_digest(morsel.value, callback_state)
+
+
+def _build_authorization_redirect(
+    provider: str, request_base_url: str, next_path: str | None
+) -> str:
+    cfg = _require_provider_config(provider)
     discovery = _get_discovery_document(cfg["issuer"])
+    discovery_issuer = str(discovery.get("issuer") or "").strip()
+    if provider == "google" and discovery_issuer != _GOOGLE_ISSUER:
+        raise OIDCAuthError(
+            "Google discovery issuer did not match the fixed issuer", status_code=502
+        )
     authorization_endpoint = str(discovery.get("authorization_endpoint") or "").strip()
     if not authorization_endpoint:
         raise OIDCConfigError("OIDC discovery document is missing authorization_endpoint")
-    redirect_uri = _resolve_redirect_uri(cfg, request_base_url)
+    redirect_uri = _resolve_redirect_uri(cfg, request_base_url, provider=provider)
     state = secrets.token_urlsafe(24)
     nonce = secrets.token_urlsafe(24)
     verifier = secrets.token_urlsafe(48)
@@ -85,6 +157,7 @@ def build_authorization_redirect(
             "nonce": nonce,
             "code_verifier": verifier,
             "next_path": _safe_next_path(next_path),
+            "provider": provider,
         },
     )
     params = {
@@ -105,18 +178,40 @@ def complete_authorization_code_flow(
     state: str,
     code: str,
 ) -> dict[str, Any]:
-    cfg = _require_oidc_config()
+    """Complete legacy generic OIDC (signature and anonymous fallback preserved)."""
+    return _complete_authorization_code_flow("oidc", request_base_url, state, code)
+
+
+def complete_google_authorization_code_flow(
+    request_base_url: str,
+    state: str,
+    code: str,
+) -> dict[str, Any]:
+    return _complete_authorization_code_flow("google", request_base_url, state, code)
+
+
+def _complete_authorization_code_flow(
+    provider: str, request_base_url: str, state: str, code: str
+) -> dict[str, Any]:
+    cfg = _require_provider_config(provider)
     pending = _consume_pending_flow(state)
     if pending is None:
         raise OIDCAuthError("Invalid OIDC state", status_code=401)
+    # Old in-memory generic states predate this field and remain generic only.
+    if pending.get("provider", "oidc") != provider:
+        raise OIDCAuthError("OIDC state was issued for a different provider", status_code=401)
     discovery = _get_discovery_document(cfg["issuer"])
     discovery_issuer = str(discovery.get("issuer") or "").strip()
-    if discovery_issuer and discovery_issuer != cfg["issuer"]:
+    if (
+        provider == "google" and discovery_issuer != _GOOGLE_ISSUER
+    ) or (
+        provider == "oidc" and discovery_issuer and discovery_issuer != cfg["issuer"]
+    ):
         raise OIDCAuthError("OIDC discovery issuer did not match the configured issuer", status_code=502)
     token_endpoint = str(discovery.get("token_endpoint") or "").strip()
     if not token_endpoint:
         raise OIDCConfigError("OIDC discovery document is missing token_endpoint")
-    redirect_uri = _resolve_redirect_uri(cfg, request_base_url)
+    redirect_uri = _resolve_redirect_uri(cfg, request_base_url, provider=provider)
     token_response = _post_form_json(
         token_endpoint,
         {
@@ -138,17 +233,29 @@ def complete_authorization_code_flow(
         nonce=pending["nonce"],
         jwks_uri=str(discovery.get("jwks_uri") or "").strip(),
     )
-    _enforce_allowlist(
-        claims,
-        allow_claim=cfg.get("allow_claim"),
-        allow_values=cfg.get("allow_values") or [],
-    )
-    return {
+    if provider == "oidc":
+        _enforce_allowlist(
+            claims,
+            allow_claim=cfg.get("allow_claim"),
+            allow_values=cfg.get("allow_values") or [],
+        )
+    result = {
         "next_path": pending["next_path"],
-        "subject": str(claims.get("sub") or ""),
-        "email": str(claims.get("email") or ""),
+        "subject": str(claims.get("sub") or "").strip(),
+        "external_issuer": cfg["issuer"],
+        "external_subject": str(claims.get("sub") or "").strip(),
+        "email": str(claims.get("email") or "").strip(),
         "claims": claims,
     }
+    if provider == "google":
+        result["user"] = _admit_google_identity(claims, cfg)
+    else:
+        user = auth_users.find_user_by_identity("oidc", cfg["issuer"], result["subject"])
+        if user is not None:
+            if user.get("enabled") is not True:
+                raise OIDCAuthError("OIDC identity is disabled", status_code=403)
+            result["user"] = user
+    return result
 
 
 def _resolve_oidc_config() -> dict[str, Any]:
@@ -180,6 +287,48 @@ def _resolve_oidc_config() -> dict[str, Any]:
     }
 
 
+def _resolve_google_config() -> dict[str, Any]:
+    """Resolve Google settings without accepting issuer or endpoint overrides."""
+    raw: dict[str, Any] = {}
+    try:
+        cfg = get_config()
+        value = cfg.get("webui_google") if isinstance(cfg, dict) else None
+        if isinstance(value, dict):
+            raw.update(value)
+    except Exception:
+        logger.debug("Failed to read webui_google config", exc_info=True)
+
+    def pick(name: str, env_name: str) -> Any:
+        env_value = os.getenv(env_name)
+        return env_value if env_value is not None else raw.get(name)
+
+    return {
+        "issuer": _GOOGLE_ISSUER,
+        "client_id": str(pick("client_id", "HERMES_WEBUI_GOOGLE_CLIENT_ID") or "").strip(),
+        "client_secret": str(pick("client_secret", "HERMES_WEBUI_GOOGLE_CLIENT_SECRET") or "").strip(),
+        "redirect_uri": str(pick("redirect_uri", "HERMES_WEBUI_GOOGLE_REDIRECT_URI") or "").strip(),
+        "scopes": list(_DEFAULT_SCOPES),
+        "allow_emails": [value.lower() for value in _normalize_allow_values(
+            pick("allow_emails", "HERMES_WEBUI_GOOGLE_ALLOW_EMAILS")
+        )],
+        "allow_domains": [value.lower() for value in _normalize_allow_values(
+            pick("allow_domains", "HERMES_WEBUI_GOOGLE_ALLOW_DOMAINS")
+        )],
+        "auto_provision": _as_bool(
+            pick("auto_provision", "HERMES_WEBUI_GOOGLE_AUTO_PROVISION")
+        ),
+        "default_profiles": _valid_profile_ids(
+            pick("default_profiles", "HERMES_WEBUI_GOOGLE_DEFAULT_PROFILES")
+        ),
+        "bootstrap_admin_email": _canonical_google_bootstrap_email(
+            pick(
+                "bootstrap_admin_email",
+                "HERMES_WEBUI_GOOGLE_BOOTSTRAP_ADMIN_EMAIL",
+            )
+        ),
+    }
+
+
 def _require_oidc_config() -> dict[str, Any]:
     cfg = _resolve_oidc_config()
     if not cfg.get("issuer") or not cfg.get("client_id"):
@@ -189,6 +338,146 @@ def _require_oidc_config() -> dict[str, Any]:
             "Native OIDC login requires webui_oidc.allow_claim and allow_values"
         )
     return cfg
+
+
+def _require_provider_config(provider: str) -> dict[str, Any]:
+    if provider == "oidc":
+        return _require_oidc_config()
+    if provider != "google":
+        raise OIDCConfigError("Unknown OIDC provider")
+    cfg = _resolve_google_config()
+    if not cfg.get("client_id"):
+        raise OIDCConfigError("Google login is not configured")
+    return cfg
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, str) and value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _valid_profile_ids(raw: Any) -> list[str]:
+    valid: list[str] = []
+    for profile_id in _normalize_text_list(raw):
+        if profile_id in valid:
+            continue
+        try:
+            auth_users._validate_profiles([profile_id])
+        except ValueError:
+            logger.warning("Ignoring invalid Google default profile ID: %r", profile_id)
+            continue
+        valid.append(profile_id)
+    return valid
+
+
+def _canonical_google_bootstrap_email(raw: Any) -> str:
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return ""
+    try:
+        return auth_users._canonical_invitation_target("google", raw)[1]
+    except ValueError:
+        # Never put the configured administrator identifier in logs.
+        logger.warning("Ignoring invalid Google bootstrap administrator email")
+        return ""
+
+
+def _admit_google_identity(claims: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    subject = str(claims.get("sub") or "").strip()
+    if not subject:
+        raise OIDCAuthError("Google id_token did not include a subject")
+
+    existing = auth_users.find_user_by_identity("google", _GOOGLE_ISSUER, subject)
+    if existing is not None:
+        if existing.get("enabled") is not True:
+            raise OIDCAuthError("Google identity is disabled", status_code=403)
+        user = auth_users.upsert_external_user(
+            "google",
+            _GOOGLE_ISSUER,
+            subject,
+            display_name=str(
+                claims.get("name")
+                or claims.get("email")
+                or existing.get("display_name")
+                or subject
+            ).strip(),
+            email=str(claims.get("email") or existing.get("email") or "").strip(),
+        )
+        if user is None:
+            raise OIDCAuthError("Google identity is not admitted", status_code=403)
+        return user
+
+    email = str(claims.get("email") or "").strip()
+    if not email or claims.get("email_verified") is not True:
+        raise OIDCAuthError("Google identity requires a verified email", status_code=403)
+    bootstrap_target = cfg.get("bootstrap_admin_email")
+    if isinstance(bootstrap_target, str) and email.lower() == bootstrap_target:
+        try:
+            bootstrapped = auth_users.bootstrap_external_admin_if_empty(
+                "google",
+                _GOOGLE_ISSUER,
+                subject,
+                _google_display_name(claims),
+                email,
+                bootstrap_target,
+                profiles=cfg.get("default_profiles", []),
+            )
+        except ValueError as exc:
+            raise OIDCAuthError(
+                "Google bootstrap administrator profiles are invalid or unavailable",
+                status_code=403,
+            ) from exc
+        if bootstrapped is not None:
+            return bootstrapped
+        # Another exact callback may have won the empty-store race. Admit only
+        # the same stable identity; a different winner keeps this caller denied.
+        raced = auth_users.find_user_by_identity("google", _GOOGLE_ISSUER, subject)
+        if raced is not None:
+            if raced.get("enabled") is not True:
+                raise OIDCAuthError("Google identity is disabled", status_code=403)
+            user = auth_users.upsert_external_user(
+                "google",
+                _GOOGLE_ISSUER,
+                subject,
+                display_name=_google_display_name(claims),
+                email=email,
+            )
+            if user is not None:
+                return user
+    invited = auth_users.consume_invitation_and_create_user(
+        "google",
+        email,
+        _GOOGLE_ISSUER,
+        subject,
+        _google_display_name(claims),
+        email,
+    )
+    if invited is not None:
+        return invited
+
+    if not cfg.get("auto_provision"):
+        raise OIDCAuthError("Google identity is not admitted", status_code=403)
+    hosted_domain = str(claims.get("hd") or "").strip()
+    email_allowed = email.lower() in cfg.get("allow_emails", [])
+    domain_allowed = bool(hosted_domain) and hosted_domain.lower() in cfg.get("allow_domains", [])
+    if not (email_allowed or domain_allowed):
+        raise OIDCAuthError("Google identity is not admitted", status_code=403)
+    user = auth_users.upsert_external_user(
+        "google",
+        _GOOGLE_ISSUER,
+        subject,
+        display_name=_google_display_name(claims),
+        email=email,
+        allow_create=True,
+        profiles=cfg.get("default_profiles", []),
+    )
+    if user is None:
+        raise OIDCAuthError("Google identity could not be provisioned", status_code=403)
+    return user
+
+
+def _google_display_name(claims: dict[str, Any]) -> str:
+    return str(claims.get("name") or claims.get("email") or claims.get("sub") or "").strip()
 
 
 def _normalize_scopes(raw: Any) -> list[str]:
@@ -251,18 +540,28 @@ def _safe_next_path(raw_path: str | None) -> str:
     return path
 
 
-def _resolve_redirect_uri(cfg: dict[str, Any], request_base_url: str) -> str:
+def _resolve_redirect_uri(
+    cfg: dict[str, Any], request_base_url: str, *, provider: str = "oidc"
+) -> str:
     explicit = str(cfg.get("redirect_uri") or "").strip()
     if explicit:
         return explicit
-    return request_base_url.rstrip("/") + "/api/auth/oidc/callback"
+    callback = "google" if provider == "google" else "oidc"
+    return request_base_url.rstrip("/") + f"/api/auth/{callback}/callback"
 
 
 def _store_pending_flow(state: str, payload: dict[str, Any]) -> None:
     now = time.time()
     with _pending_lock:
         _prune_pending_flows(now)
-        _trim_pending_flows()
+        if state in _pending_flows:
+            raise OIDCAuthError(
+                "Authentication flow state could not be reserved", status_code=503
+            )
+        if len(_pending_flows) >= _MAX_PENDING_FLOWS:
+            raise OIDCAuthError(
+                "Too many authentication flows are already pending", status_code=429
+            )
         _pending_flows[state] = payload
 
 
@@ -281,18 +580,6 @@ def _prune_pending_flows(now: float) -> None:
         if now - float(payload.get("created_at") or 0) > _PENDING_TTL_SECONDS
     ]
     for state in expired:
-        _pending_flows.pop(state, None)
-
-
-def _trim_pending_flows() -> None:
-    overflow = len(_pending_flows) - _MAX_PENDING_FLOWS + 1
-    if overflow <= 0:
-        return
-    oldest = sorted(
-        _pending_flows,
-        key=lambda state: float(_pending_flows[state].get("created_at") or 0),
-    )
-    for state in oldest[:overflow]:
         _pending_flows.pop(state, None)
 
 
