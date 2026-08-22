@@ -12350,6 +12350,24 @@ def _redirect(handler, location: str) -> bool:
     return True
 
 
+def _member_room_principal(handler):
+    from api.auth import current_principal
+    principal = current_principal(handler)
+    if not isinstance(principal, dict) or not principal.get("id") or principal.get("role") == "admin":
+        return None
+    return principal
+
+
+def _member_room_payload(handler, room_id, principal):
+    from api import member_rooms
+    room = member_rooms.get_room(room_id)
+    if room is None or not member_rooms.user_is_member(room_id, principal["id"]):
+        return None
+    room["participants"] = member_rooms.list_participants(room_id, principal["id"])
+    room["messages"] = member_rooms.list_messages(room_id, principal["id"])
+    return room
+
+
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
     proxy_result = _handle_extension_sidecar_proxy(handler, parsed, "GET")
@@ -12391,6 +12409,34 @@ def handle_get(handler, parsed) -> bool:
             return bad(handler, "Forbidden", 403)
         from api.user_bots import list_bots
         return j(handler, {"bots": list_bots(principal["id"])})
+
+    if parsed.path == "/api/member/rooms":
+        principal = _member_room_principal(handler)
+        if principal is None:
+            return bad(handler, "Forbidden", 403)
+        from api import member_rooms
+        rooms = []
+        for room in member_rooms.list_rooms(principal["id"]):
+            room["participants"] = member_rooms.list_participants(room["id"], principal["id"])
+            room["messages"] = member_rooms.list_messages(room["id"], principal["id"], limit=1)
+            rooms.append(room)
+        return j(handler, {"rooms": rooms})
+
+    match = __import__("re").fullmatch(r"/api/member/rooms/([^/]+)", parsed.path)
+    if match:
+        principal = _member_room_principal(handler)
+        if principal is None:
+            return bad(handler, "Forbidden", 403)
+        room = _member_room_payload(handler, match.group(1), principal)
+        return j(handler, {"room": room}) if room else bad(handler, "Not found", 404)
+
+    if parsed.path == "/api/member/members":
+        principal = _member_room_principal(handler)
+        if principal is None:
+            return bad(handler, "Forbidden", 403)
+        from api.auth_users import list_users
+        users = [{"id": u.get("id"), "username": u.get("username"), "display_name": u.get("display_name")} for u in list_users() if u.get("enabled", True) and u.get("id") != principal["id"]]
+        return j(handler, {"members": users})
 
     if parsed.path == "/admin/users":
         principal = _named_admin_principal(handler)
@@ -14743,6 +14789,35 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, str(exc), 400)
         except Exception as exc:
             return _admin_store_error(handler, exc)
+
+    if parsed.path == "/api/member/rooms":
+        if not _check_csrf(handler):
+            return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        principal = _member_room_principal(handler)
+        if principal is None:
+            return bad(handler, "Forbidden", 403)
+        try:
+            body = read_body(handler)
+            from api import member_rooms
+            room = member_rooms.create_room(principal["id"], kind=body.get("kind"), name=body.get("name", ""), participant_user_ids=body.get("participant_user_ids", []), orchestrator_enabled=body.get("orchestrator_enabled", False))
+            return j(handler, {"room": room}, status=201)
+        except (ValueError, KeyError, TypeError) as exc:
+            return bad(handler, str(exc), 400)
+
+    match = _re.fullmatch(r"/api/member/rooms/([^/]+)/messages", parsed.path)
+    if match:
+        if not _check_csrf(handler):
+            return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        principal = _member_room_principal(handler)
+        if principal is None:
+            return bad(handler, "Forbidden", 403)
+        try:
+            body = read_body(handler)
+            from api import member_rooms
+            message = member_rooms.add_message(match.group(1), principal["id"], body.get("body", ""))
+            return j(handler, {"message": message}, status=201)
+        except (ValueError, KeyError, TypeError) as exc:
+            return bad(handler, str(exc), 400)
 
     if parsed.path == "/api/admin/invitations":
         try:
@@ -17595,6 +17670,25 @@ def handle_post(handler, parsed) -> bool:
 
 def handle_patch(handler, parsed) -> bool:
     """Handle all PATCH routes. Returns True if handled, False for 404."""
+    match = _re.fullmatch(r"/api/member/rooms/([^/]+)/orchestrator", parsed.path)
+    if match:
+        if not _check_csrf(handler):
+            return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        principal = _member_room_principal(handler)
+        if principal is None:
+            return bad(handler, "Forbidden", 403)
+        from api import member_rooms
+        room = member_rooms.get_room(match.group(1))
+        participants = member_rooms.list_participants(match.group(1), principal["id"])
+        if room is None or not any(p.get("participant_id") == principal["id"] and p.get("role") == "owner" for p in participants):
+            return bad(handler, "Not found", 404)
+        try:
+            body = read_body(handler)
+            updated = member_rooms.set_orchestrator(match.group(1), bool(body.get("enabled")))
+            return j(handler, {"room": updated})
+        except (ValueError, KeyError, TypeError) as exc:
+            return bad(handler, str(exc), 400)
+
     match = _re.fullmatch(r"/api/admin/users/([^/]+)", parsed.path)
     if match:
         if not _check_named_admin_origin(handler):
