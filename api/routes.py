@@ -12789,6 +12789,7 @@ def handle_get(handler, parsed) -> bool:
             is_oidc_auth_enabled,
             is_trusted_auth_enabled,
         )
+        from api.auth_users import has_local_users
         from api.passkeys import registered_credentials
         from api.auth_oidc import is_google_enabled
         from api.auth_github import is_github_enabled
@@ -12823,7 +12824,9 @@ def handle_get(handler, parsed) -> bool:
                 passkeys = []
                 passkeys_known = False
         trusted_auth_enabled, _ = discover_bool(is_trusted_auth_enabled)
+        local_users_enabled, _ = discover_bool(has_local_users)
         auth_enabled = any((
+            local_users_enabled,
             password_auth_enabled,
             oidc_enabled,
             google_enabled,
