@@ -12790,8 +12790,21 @@ def handle_get(handler, parsed) -> bool:
             is_trusted_auth_enabled,
         )
         from api.passkeys import registered_credentials
-        from api.auth_oidc import is_google_enabled
-        from api.auth_github import is_github_enabled
+
+        # Google/GitHub are optional provider integrations. Keep a missing or
+        # version-mismatched integration from taking down this public status
+        # endpoint; the provider is reported disabled until its implementation
+        # is available.
+        try:
+            from api.auth_oidc import is_google_enabled
+        except (ImportError, AttributeError):
+            def is_google_enabled():
+                return False
+        try:
+            from api.auth_github import is_github_enabled
+        except (ImportError, AttributeError):
+            def is_github_enabled():
+                return False
 
         # Discover each capability in its own failure boundary. A broken provider
         # configuration must hide only that provider and must never turn this
@@ -12843,6 +12856,17 @@ def handle_get(handler, parsed) -> bool:
             and bool(passkeys)
             and not password_auth_enabled
         )
+        # Status discovery is a public capability probe. A damaged settings
+        # file or a transient config/model lookup failure must not turn it into
+        # a 500 and prevent the login page from rendering.
+        auth_disabled_acknowledged = False
+        if not auth_enabled:
+            try:
+                auth_disabled_acknowledged = bool(
+                    load_settings().get("auth_disabled_acknowledged")
+                )
+            except Exception:
+                auth_disabled_acknowledged = False
         payload = {
             "auth_enabled": auth_enabled,
             "logged_in": logged_in,
@@ -12854,7 +12878,7 @@ def handle_get(handler, parsed) -> bool:
             "passkeys_enabled": bool(passkeys),
             "passkeys_count": len(passkeys),
             "passkey_feature_flag": passkey_flag,
-            "auth_disabled_acknowledged": bool(load_settings().get("auth_disabled_acknowledged")) if not auth_enabled else False,
+            "auth_disabled_acknowledged": auth_disabled_acknowledged,
         }
         if trusted_auth_enabled or (session_info and session_info.get("auth_type") == "trusted"):
             payload["trusted_auth_enabled"] = True

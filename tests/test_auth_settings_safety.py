@@ -80,6 +80,27 @@ def _post_settings(body_dict, cookie=""):
     return handler
 
 
+def test_auth_status_survives_settings_loader_failure(monkeypatch):
+    """A public capability probe must not become a 500 on settings failure."""
+    import api.auth as auth
+    import api.passkeys as passkeys
+    import api.routes as routes
+
+    monkeypatch.setattr(auth, "get_password_hash", lambda: None)
+    monkeypatch.setattr(auth, "is_oidc_auth_enabled", lambda: False)
+    monkeypatch.setattr(auth, "is_trusted_auth_enabled", lambda: False)
+    monkeypatch.setattr(auth, "_passkey_feature_flag_enabled", lambda: False)
+    monkeypatch.setattr(passkeys, "registered_credentials", lambda: [])
+    monkeypatch.setattr(routes, "load_settings", lambda: (_ for _ in ()).throw(OSError("broken settings")))
+
+    from api.routes import handle_get
+    handler = _FakeHandler()
+    handle_get(handler, urlparse("http://example.com/api/auth/status"))
+
+    assert handler.status == 200
+    assert handler.json_body()["auth_enabled"] is False
+
+
 def _get_settings():
     from api.routes import handle_get
     handler = _FakeHandler()
