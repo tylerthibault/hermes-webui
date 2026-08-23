@@ -12462,11 +12462,11 @@ def handle_get(handler, parsed) -> bool:
         token = csrf_token_for_session(cookie_value) if cookie_value and verify_session(cookie_value) else ""
         return t(handler, page.replace("window.__CSRF_TOKEN__", json.dumps(token)), content_type="text/html; charset=utf-8")
 
-    if parsed.path == "/dashboard":
+    if parsed.path in ("/rooms", "/dashboard"):
         from api.auth import current_principal
         principal = current_principal(handler)
-        if not isinstance(principal, dict) or principal.get("role") == "admin":
-            return _redirect(handler, "/")
+        if not isinstance(principal, dict):
+            return _redirect(handler, "/login?next=/rooms")
         dashboard_path = (Path(__file__).parent.parent / "static" / "member-dashboard.html").resolve()
         html = dashboard_path.read_text(encoding="utf-8")
         from api.auth import csrf_token_for_session, parse_cookie, verify_session
@@ -12474,12 +12474,11 @@ def handle_get(handler, parsed) -> bool:
         csrf_token = csrf_token_for_session(cookie_value) if cookie_value and verify_session(cookie_value) else ""
         html = html.replace("window.__CSRF_TOKEN__", json.dumps(csrf_token))
         return t(handler, html, content_type="text/html; charset=utf-8")
-
     if parsed.path in ("/", "/index.html"):
         from api.auth import current_principal
         principal = current_principal(handler)
         if isinstance(principal, dict) and principal.get("role") != "admin":
-            return _redirect(handler, "/dashboard")
+            return _redirect(handler, "/rooms")
 
     if parsed.path in ("/", "/index.html") or parsed.path.startswith("/session/"):
         try:

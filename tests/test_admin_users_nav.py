@@ -1,10 +1,12 @@
 from pathlib import Path
 
 
-def test_admin_users_nav_is_present_and_role_gated():
+def test_rooms_nav_replaces_admin_users_rail_action():
     html = (Path(__file__).parents[1] / "static/index.html").read_text()
     ui = (Path(__file__).parents[1] / "static/ui.js").read_text()
-    assert 'id="adminUsersRailBtn"' in html
-    assert 'href="/admin/users"' in html
-    assert "data.user.role==='admin'" in ui
-    assert "data-admin-users-link" in ui
+    assert 'id="roomsRailBtn"' in html
+    assert 'href="/rooms"' in html
+    assert 'data-room-link' in html
+    assert "authenticated=data&&data.authenticated===true" in ui
+    assert "data-room-link" in ui
+    assert 'id="adminUsersRailBtn"' not in html

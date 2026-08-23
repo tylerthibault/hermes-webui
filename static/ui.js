@@ -1772,22 +1772,22 @@ function _initNavActionMirrors(){
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',_initNavActionMirrors,{once:true});
 else _initNavActionMirrors();
-function _initAdminUsersNav(){
+function _initRoomsNav(){
   const apply=async()=>{
-    let isAdmin=false;
+    let authenticated=false;
     try{
       const response=await fetch('/api/auth/me',{credentials:'include',cache:'no-store'});
-      if(response.ok){const data=await response.json();isAdmin=data&&data.authenticated===true&&data.user&&data.user.role==='admin';}
+      if(response.ok){const data=await response.json();authenticated=data&&data.authenticated===true;}
     }catch(_){/* unauthenticated or unavailable: keep the control hidden */}
-    document.querySelectorAll('[data-admin-users-link]').forEach(link=>{
-      link.style.display=isAdmin?'':'none';
-      link.classList.toggle('nav-action-visible',isAdmin);
+    document.querySelectorAll('[data-room-link]').forEach(link=>{
+      link.style.display=authenticated?'':'none';
+      link.classList.toggle('nav-action-visible',authenticated);
     });
   };
   void apply();
 }
-if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',_initAdminUsersNav,{once:true});
-else _initAdminUsersNav();
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',_initRoomsNav,{once:true});
+else _initRoomsNav();
 function _applyDashboardStatus(status){
   const running=!!(status&&status.running);
   const url=running?_dashboardBrowserUrl(status):'';
