@@ -14824,11 +14824,26 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Forbidden", 403)
         try:
             body = read_body(handler)
+            if not isinstance(body, dict): return bad(handler, "Invalid request", 400)
             from api import member_rooms
             room = member_rooms.create_room(principal["id"], kind=body.get("kind"), name=body.get("name", ""), participant_user_ids=body.get("participant_user_ids", []), orchestrator_enabled=body.get("orchestrator_enabled", False))
             return j(handler, {"room": room}, status=201)
         except (ValueError, KeyError, TypeError) as exc:
             return bad(handler, str(exc), 400)
+
+    match = _ROUTE_RE.fullmatch(r"/api/member/rooms/([^/]+)/members", parsed.path)
+    if match:
+        if not _check_csrf(handler): return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        principal = _member_room_principal(handler)
+        if principal is None: return bad(handler, "Forbidden", 403)
+        try:
+            body = read_body(handler)
+            if not isinstance(body, dict): return bad(handler, "Invalid request", 400)
+            from api import member_rooms
+            member = member_rooms.add_member(match.group(1), principal["id"], body.get("user_id"))
+            return j(handler, {"participant": member}, status=201)
+        except PermissionError as exc: return bad(handler, str(exc), 403)
+        except (ValueError, KeyError, TypeError) as exc: return bad(handler, str(exc), 400)
 
     match = _ROUTE_RE.fullmatch(r"/api/member/rooms/([^/]+)/bots", parsed.path)
     if match:
@@ -14838,6 +14853,7 @@ def handle_post(handler, parsed) -> bool:
         if principal is None: return bad(handler, "Forbidden", 403)
         try:
             body = read_body(handler)
+            if not isinstance(body, dict): return bad(handler, "Invalid request", 400)
             from api import member_rooms
             bot = member_rooms.invite_bot(match.group(1), principal["id"], body.get("bot_id"), int(body.get("participation_level", 70)))
             return j(handler, {"bot": bot}, status=201)
@@ -14853,6 +14869,7 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Forbidden", 403)
         try:
             body = read_body(handler)
+            if not isinstance(body, dict): return bad(handler, "Invalid request", 400)
             from api import member_rooms
             message = member_rooms.add_message(match.group(1), principal["id"], body.get("body", ""))
             return j(handler, {"message": message}, status=201)
@@ -17728,6 +17745,19 @@ def handle_post(handler, parsed) -> bool:
 
 def handle_patch(handler, parsed) -> bool:
     """Handle all PATCH routes. Returns True if handled, False for 404."""
+    match = _ROUTE_RE.fullmatch(r"/api/member/rooms/([^/]+)/name", parsed.path)
+    if match:
+        if not _check_csrf(handler): return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        principal = _member_room_principal(handler)
+        if principal is None: return bad(handler, "Forbidden", 403)
+        try:
+            body = read_body(handler)
+            if not isinstance(body, dict): return bad(handler, "Invalid request", 400)
+            from api import member_rooms
+            return j(handler, {"room": member_rooms.rename_room(match.group(1), principal["id"], body.get("name"))})
+        except PermissionError as exc: return bad(handler, str(exc), 403)
+        except (ValueError, KeyError, TypeError) as exc: return bad(handler, str(exc), 400)
+
     bot_match = _ROUTE_RE.fullmatch(r"/api/member/rooms/([^/]+)/bots/([^/]+)", parsed.path)
     if bot_match:
         if not _check_csrf(handler): return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
@@ -17735,6 +17765,7 @@ def handle_patch(handler, parsed) -> bool:
         if principal is None: return bad(handler, "Forbidden", 403)
         try:
             body = read_body(handler)
+            if not isinstance(body, dict): return bad(handler, "Invalid request", 400)
             from api import member_rooms
             bot = member_rooms.set_bot_participation(bot_match.group(1), principal["id"], bot_match.group(2), enabled=body.get("enabled"), participation_level=body.get("participation_level"))
             return j(handler, {"bot": bot})
@@ -17755,6 +17786,7 @@ def handle_patch(handler, parsed) -> bool:
             return bad(handler, "Not found", 404)
         try:
             body = read_body(handler)
+            if not isinstance(body, dict): return bad(handler, "Invalid request", 400)
             updated = member_rooms.set_orchestrator(match.group(1), bool(body.get("enabled")))
             return j(handler, {"room": updated})
         except (ValueError, KeyError, TypeError) as exc:
@@ -17807,7 +17839,30 @@ def handle_patch(handler, parsed) -> bool:
 
 def handle_delete(handler, parsed) -> bool:
     """Handle all DELETE routes. Returns True if handled, False for 404."""
-    match = _re.fullmatch(r"/api/user/bots/([^/]+)", parsed.path)
+    match = _ROUTE_RE.fullmatch(r"/api/member/rooms/([^/]+)/members/([^/]+)", parsed.path)
+    if match:
+        if not _check_csrf(handler): return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        principal = _member_room_principal(handler)
+        if principal is None: return bad(handler, "Forbidden", 403)
+        from api import member_rooms
+        try:
+            member_rooms.remove_member(match.group(1), principal["id"], match.group(2))
+            return j(handler, {"ok": True})
+        except PermissionError as exc: return bad(handler, str(exc), 403)
+        except (ValueError, KeyError, TypeError) as exc: return bad(handler, str(exc), 400)
+
+    match = _ROUTE_RE.fullmatch(r"/api/member/rooms/([^/]+)/leave", parsed.path)
+    if match:
+        if not _check_csrf(handler): return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        principal = _member_room_principal(handler)
+        if principal is None: return bad(handler, "Forbidden", 403)
+        from api import member_rooms
+        try:
+            member_rooms.leave_room(match.group(1), principal["id"])
+            return j(handler, {"ok": True})
+        except (ValueError, KeyError, TypeError) as exc: return bad(handler, str(exc), 400)
+
+    match = _ROUTE_RE.fullmatch(r"/api/user/bots/([^/]+)", parsed.path)
     if match:
         from api.auth import current_principal
         principal = current_principal(handler)

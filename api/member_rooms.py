@@ -116,6 +116,13 @@ def create_room(owner_user_id: str, *, kind: str, name: str, participant_user_id
         raise ValueError("direct rooms require exactly two users")
     with _locked():
         data = _read()
+        if kind == "direct":
+            target = set(users)
+            for existing in data["rooms"]:
+                if existing.get("kind") != "direct" or existing.get("archived"): continue
+                members = {p["participant_id"] for p in data["participants"] if p["room_id"] == existing["id"] and p["participant_type"] == "user" and p.get("active", True)}
+                if members == target:
+                    return copy.deepcopy(existing)
         room_id = uuid.uuid4().hex
         now = _now()
         room = {"id": room_id, "kind": kind, "name": name.strip(), "created_by": owner_user_id, "created_at": now, "updated_at": now, "archived": False, "orchestrator_enabled": bool(orchestrator_enabled), "orchestrator_disabled_at": None}
@@ -159,6 +166,7 @@ def set_orchestrator(room_id: str, enabled: bool) -> dict[str, Any]:
     with _locked():
         data = _read(); room = _room(data, room_id)
         if room is None: raise KeyError(room_id)
+        if room.get("kind") != "room": raise ValueError("direct rooms cannot use the orchestrator")
         room["orchestrator_enabled"] = bool(enabled)
         room["orchestrator_disabled_at"] = None if enabled else _now()
         room["updated_at"] = _now(); _write(data)
@@ -209,6 +217,64 @@ def set_bot_participation(room_id: str, owner_user_id: str, bot_id: str, *, enab
         if participation_level is not None: bot["participation_level"] = participation_level
         bot["updated_at"] = _now(); room["updated_at"] = bot["updated_at"]; _write(data)
         return copy.deepcopy(bot)
+
+
+def _owner(data: dict[str, Any], room_id: str, user_id: str) -> bool:
+    return any(p["room_id"] == room_id and p["participant_type"] == "user" and p["participant_id"] == user_id and p.get("role") == "owner" and p.get("active", True) for p in data["participants"])
+
+
+def add_member(room_id: str, owner_user_id: str, member_user_id: str) -> dict[str, Any]:
+    _safe(room_id, "room id"); _safe(owner_user_id, "owner user id"); _safe(member_user_id, "member user id")
+    with _locked():
+        data = _read(); room = _room(data, room_id)
+        if room is None: raise KeyError(room_id)
+        if room.get("kind") != "room": raise ValueError("direct rooms cannot be managed as shared rooms")
+        if not _owner(data, room_id, owner_user_id): raise PermissionError("only the room owner can add members")
+        existing = next((p for p in data["participants"] if p["room_id"] == room_id and p["participant_type"] == "user" and p["participant_id"] == member_user_id), None)
+        now = _now()
+        if existing:
+            existing.update(active=True, updated_at=now); result = existing
+        else:
+            result = {"room_id": room_id, "participant_type": "user", "participant_id": member_user_id, "role": "member", "active": True, "joined_at": now}
+            data["participants"].append(result)
+        room["updated_at"] = now; _write(data)
+        return copy.deepcopy(result)
+
+
+def remove_member(room_id: str, owner_user_id: str, member_user_id: str) -> dict[str, Any]:
+    _safe(room_id, "room id"); _safe(owner_user_id, "owner user id"); _safe(member_user_id, "member user id")
+    with _locked():
+        data = _read(); room = _room(data, room_id)
+        if room is None: raise KeyError(room_id)
+        if room.get("kind") != "room": raise ValueError("direct rooms cannot be managed as shared rooms")
+        if not _owner(data, room_id, owner_user_id): raise PermissionError("only the room owner can remove members")
+        participant = next((p for p in data["participants"] if p["room_id"] == room_id and p["participant_type"] == "user" and p["participant_id"] == member_user_id and p.get("active", True)), None)
+        if participant is None or participant.get("role") == "owner": raise ValueError("member cannot be removed")
+        participant["active"] = False; participant["left_at"] = _now(); room["updated_at"] = participant["left_at"]; _write(data)
+        return copy.deepcopy(participant)
+
+
+def leave_room(room_id: str, user_id: str) -> dict[str, Any]:
+    _safe(room_id, "room id"); _safe(user_id, "user id")
+    with _locked():
+        data = _read(); room = _room(data, room_id)
+        if room is None: raise KeyError(room_id)
+        participant = next((p for p in data["participants"] if p["room_id"] == room_id and p["participant_type"] == "user" and p["participant_id"] == user_id and p.get("active", True)), None)
+        if participant is None or participant.get("role") == "owner": raise ValueError("room owner cannot leave")
+        participant["active"] = False; participant["left_at"] = _now(); room["updated_at"] = participant["left_at"]; _write(data)
+        return copy.deepcopy(participant)
+
+
+def rename_room(room_id: str, owner_user_id: str, name: str) -> dict[str, Any]:
+    _safe(room_id, "room id"); _safe(owner_user_id, "owner user id")
+    if not isinstance(name, str) or not name.strip() or len(name) > 128: raise ValueError("room name is invalid")
+    with _locked():
+        data = _read(); room = _room(data, room_id)
+        if room is None: raise KeyError(room_id)
+        if room.get("kind") != "room": raise ValueError("direct rooms cannot be managed as shared rooms")
+        if not _owner(data, room_id, owner_user_id): raise PermissionError("only the room owner can rename rooms")
+        room["name"] = name.strip(); room["updated_at"] = _now(); _write(data)
+        return copy.deepcopy(room)
 
 
 def add_message(room_id: str, sender_id: str, body: str, *, sender_type: str = "user") -> dict[str, Any]:
