@@ -165,6 +165,52 @@ def set_orchestrator(room_id: str, enabled: bool) -> dict[str, Any]:
         return copy.deepcopy(room)
 
 
+def invite_bot(room_id: str, owner_user_id: str, bot_id: str, participation_level: int = 70) -> dict[str, Any]:
+    _safe(room_id, "room id"); _safe(owner_user_id, "owner user id"); _safe(bot_id, "bot id")
+    if not isinstance(participation_level, int) or not 0 <= participation_level <= 100:
+        raise ValueError("participation level is invalid")
+    with _locked():
+        data = _read(); room = _room(data, room_id)
+        if room is None: raise KeyError(room_id)
+        if not any(p["room_id"] == room_id and p["participant_id"] == owner_user_id and p["participant_type"] == "user" and p.get("role") == "owner" and p.get("active", True) for p in data["participants"]):
+            raise PermissionError("only the room owner can invite bots")
+    from api.user_bots import get_bot
+    if get_bot(bot_id, owner_user_id) is None:
+        raise KeyError(bot_id)
+    with _locked():
+        data = _read(); room = _room(data, room_id)
+        if room is None: raise KeyError(room_id)
+        if not any(p["room_id"] == room_id and p["participant_id"] == owner_user_id and p["participant_type"] == "user" and p.get("role") == "owner" and p.get("active", True) for p in data["participants"]):
+            raise PermissionError("only the room owner can invite bots")
+        existing = next((p for p in data["participants"] if p["room_id"] == room_id and p["participant_type"] == "bot" and p["participant_id"] == bot_id), None)
+        now = _now()
+        if existing:
+            existing.update(active=True, participation_level=participation_level, updated_at=now)
+            result = existing
+        else:
+            result = {"room_id": room_id, "participant_type": "bot", "participant_id": bot_id, "role": "bot", "active": True, "participation_level": participation_level, "joined_at": now, "updated_at": now}
+            data["participants"].append(result)
+        room["updated_at"] = now; _write(data)
+        return copy.deepcopy(result)
+
+
+def set_bot_participation(room_id: str, owner_user_id: str, bot_id: str, *, enabled: bool | None = None, participation_level: int | None = None) -> dict[str, Any]:
+    _safe(room_id, "room id"); _safe(owner_user_id, "owner user id"); _safe(bot_id, "bot id")
+    if participation_level is not None and (not isinstance(participation_level, int) or not 0 <= participation_level <= 100):
+        raise ValueError("participation level is invalid")
+    with _locked():
+        data = _read(); room = _room(data, room_id)
+        if room is None: raise KeyError(room_id)
+        if not any(p["room_id"] == room_id and p["participant_id"] == owner_user_id and p["participant_type"] == "user" and p.get("role") == "owner" and p.get("active", True) for p in data["participants"]):
+            raise PermissionError("only the room owner can update bots")
+        bot = next((p for p in data["participants"] if p["room_id"] == room_id and p["participant_type"] == "bot" and p["participant_id"] == bot_id), None)
+        if bot is None: raise KeyError(bot_id)
+        if enabled is not None: bot["active"] = bool(enabled)
+        if participation_level is not None: bot["participation_level"] = participation_level
+        bot["updated_at"] = _now(); room["updated_at"] = bot["updated_at"]; _write(data)
+        return copy.deepcopy(bot)
+
+
 def add_message(room_id: str, sender_id: str, body: str, *, sender_type: str = "user") -> dict[str, Any]:
     _safe(room_id, "room id"); _safe(sender_id, "sender id")
     if sender_type not in {"user", "bot", "orchestrator"} or not isinstance(body, str) or not body.strip() or len(body) > _MAX_MESSAGE:

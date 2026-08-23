@@ -16,6 +16,7 @@ import logging
 import os
 import queue
 import re
+_ROUTE_RE = re
 import platform
 import shlex
 import shutil
@@ -12422,7 +12423,7 @@ def handle_get(handler, parsed) -> bool:
             rooms.append(room)
         return j(handler, {"rooms": rooms})
 
-    match = __import__("re").fullmatch(r"/api/member/rooms/([^/]+)", parsed.path)
+    match = _ROUTE_RE.fullmatch(r"/api/member/rooms/([^/]+)", parsed.path)
     if match:
         principal = _member_room_principal(handler)
         if principal is None:
@@ -14804,7 +14805,21 @@ def handle_post(handler, parsed) -> bool:
         except (ValueError, KeyError, TypeError) as exc:
             return bad(handler, str(exc), 400)
 
-    match = _re.fullmatch(r"/api/member/rooms/([^/]+)/messages", parsed.path)
+    match = _ROUTE_RE.fullmatch(r"/api/member/rooms/([^/]+)/bots", parsed.path)
+    if match:
+        if not _check_csrf(handler):
+            return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        principal = _member_room_principal(handler)
+        if principal is None: return bad(handler, "Forbidden", 403)
+        try:
+            body = read_body(handler)
+            from api import member_rooms
+            bot = member_rooms.invite_bot(match.group(1), principal["id"], body.get("bot_id"), int(body.get("participation_level", 70)))
+            return j(handler, {"bot": bot}, status=201)
+        except PermissionError as exc: return bad(handler, str(exc), 403)
+        except (ValueError, KeyError, TypeError) as exc: return bad(handler, str(exc), 400)
+
+    match = _ROUTE_RE.fullmatch(r"/api/member/rooms/([^/]+)/messages", parsed.path)
     if match:
         if not _check_csrf(handler):
             return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
@@ -17670,7 +17685,20 @@ def handle_post(handler, parsed) -> bool:
 
 def handle_patch(handler, parsed) -> bool:
     """Handle all PATCH routes. Returns True if handled, False for 404."""
-    match = _re.fullmatch(r"/api/member/rooms/([^/]+)/orchestrator", parsed.path)
+    bot_match = _ROUTE_RE.fullmatch(r"/api/member/rooms/([^/]+)/bots/([^/]+)", parsed.path)
+    if bot_match:
+        if not _check_csrf(handler): return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        principal = _member_room_principal(handler)
+        if principal is None: return bad(handler, "Forbidden", 403)
+        try:
+            body = read_body(handler)
+            from api import member_rooms
+            bot = member_rooms.set_bot_participation(bot_match.group(1), principal["id"], bot_match.group(2), enabled=body.get("enabled"), participation_level=body.get("participation_level"))
+            return j(handler, {"bot": bot})
+        except PermissionError as exc: return bad(handler, str(exc), 403)
+        except (ValueError, KeyError, TypeError) as exc: return bad(handler, str(exc), 400)
+
+    match = _ROUTE_RE.fullmatch(r"/api/member/rooms/([^/]+)/orchestrator", parsed.path)
     if match:
         if not _check_csrf(handler):
             return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
