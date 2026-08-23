@@ -14826,7 +14826,7 @@ def handle_post(handler, parsed) -> bool:
             body = read_body(handler)
             if not isinstance(body, dict): return bad(handler, "Invalid request", 400)
             from api import member_rooms
-            room = member_rooms.create_room(principal["id"], kind=body.get("kind"), name=body.get("name", ""), participant_user_ids=body.get("participant_user_ids", []), orchestrator_enabled=body.get("orchestrator_enabled", False))
+            room = member_rooms.create_room(principal["id"], kind=body.get("kind"), name=body.get("name", ""), participant_user_ids=body.get("participant_user_ids", []), orchestrator_enabled=body.get("orchestrator_enabled", False), bot_ids=body.get("bot_ids", []))
             return j(handler, {"room": room}, status=201)
         except (ValueError, KeyError, TypeError) as exc:
             return bad(handler, str(exc), 400)

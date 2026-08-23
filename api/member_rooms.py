@@ -101,14 +101,31 @@ def user_is_member(room_id: str, user_id: str) -> bool:
         return any(p["room_id"] == room_id and p["participant_type"] == "user" and p["participant_id"] == user_id and p.get("active", True) for p in _read()["participants"])
 
 
-def create_room(owner_user_id: str, *, kind: str, name: str, participant_user_ids: list[str], orchestrator_enabled: bool = False) -> dict[str, Any]:
+def create_room(owner_user_id: str, *, kind: str, name: str, participant_user_ids: list[str], orchestrator_enabled: bool = False, bot_ids: list[str] | None = None) -> dict[str, Any]:
     _safe(owner_user_id, "owner user id")
     if kind not in {"direct", "room"}:
         raise ValueError("room kind is invalid")
     if kind == "direct":
         orchestrator_enabled = False
+        if bot_ids:
+            raise ValueError("direct rooms cannot include bots")
+    if bot_ids is None:
+        bot_ids = []
+    if not isinstance(bot_ids, list) or any(not isinstance(bot_id, str) for bot_id in bot_ids):
+        raise ValueError("bot ids are invalid")
+    bot_ids = list(dict.fromkeys(bot_ids))
+    if len(bot_ids) > 20:
+        raise ValueError("too many bots")
+    if bot_ids:
+        from api.user_bots import get_bot
+        for bot_id in bot_ids:
+            _safe(bot_id, "bot id")
+            if get_bot(bot_id, owner_user_id) is None:
+                raise KeyError(bot_id)
     if not isinstance(name, str) or len(name) > 128:
         raise ValueError("room name is invalid")
+    if not isinstance(participant_user_ids, list) or any(not isinstance(user_id, str) for user_id in participant_user_ids):
+        raise ValueError("participant user ids are invalid")
     users = list(dict.fromkeys([owner_user_id, *participant_user_ids]))
     for user_id in users:
         _safe(user_id, "participant user id")
@@ -129,6 +146,8 @@ def create_room(owner_user_id: str, *, kind: str, name: str, participant_user_id
         data["rooms"].append(room)
         for user_id in users:
             data["participants"].append({"room_id": room_id, "participant_type": "user", "participant_id": user_id, "role": "owner" if user_id == owner_user_id else "member", "active": True, "joined_at": now})
+        for bot_id in bot_ids:
+            data["participants"].append({"room_id": room_id, "participant_type": "bot", "participant_id": bot_id, "role": "bot", "active": True, "participation_level": 70, "joined_at": now, "updated_at": now})
         _write(data)
         return copy.deepcopy(room)
 
@@ -180,6 +199,7 @@ def invite_bot(room_id: str, owner_user_id: str, bot_id: str, participation_leve
     with _locked():
         data = _read(); room = _room(data, room_id)
         if room is None: raise KeyError(room_id)
+        if room.get("kind") != "room": raise ValueError("direct rooms cannot include bots")
         if not any(p["room_id"] == room_id and p["participant_id"] == owner_user_id and p["participant_type"] == "user" and p.get("role") == "owner" and p.get("active", True) for p in data["participants"]):
             raise PermissionError("only the room owner can invite bots")
     from api.user_bots import get_bot
@@ -188,6 +208,7 @@ def invite_bot(room_id: str, owner_user_id: str, bot_id: str, participation_leve
     with _locked():
         data = _read(); room = _room(data, room_id)
         if room is None: raise KeyError(room_id)
+        if room.get("kind") != "room": raise ValueError("direct rooms cannot include bots")
         if not any(p["room_id"] == room_id and p["participant_id"] == owner_user_id and p["participant_type"] == "user" and p.get("role") == "owner" and p.get("active", True) for p in data["participants"]):
             raise PermissionError("only the room owner can invite bots")
         existing = next((p for p in data["participants"] if p["room_id"] == room_id and p["participant_type"] == "bot" and p["participant_id"] == bot_id), None)
@@ -209,6 +230,7 @@ def set_bot_participation(room_id: str, owner_user_id: str, bot_id: str, *, enab
     with _locked():
         data = _read(); room = _room(data, room_id)
         if room is None: raise KeyError(room_id)
+        if room.get("kind") != "room": raise ValueError("direct rooms cannot include bots")
         if not any(p["room_id"] == room_id and p["participant_id"] == owner_user_id and p["participant_type"] == "user" and p.get("role") == "owner" and p.get("active", True) for p in data["participants"]):
             raise PermissionError("only the room owner can update bots")
         bot = next((p for p in data["participants"] if p["room_id"] == room_id and p["participant_type"] == "bot" and p["participant_id"] == bot_id), None)
