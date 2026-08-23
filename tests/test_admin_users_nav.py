@@ -7,6 +7,6 @@ def test_rooms_nav_replaces_admin_users_rail_action():
     assert 'id="roomsRailBtn"' in html
     assert 'href="/rooms"' in html
     assert 'data-room-link' in html
-    assert "authenticated=data&&data.authenticated===true" in ui
+    assert "authenticated=(await r.json()).authenticated===true" in ui
     assert "data-room-link" in ui
     assert 'id="adminUsersRailBtn"' not in html

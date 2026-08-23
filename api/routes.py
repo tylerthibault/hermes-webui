@@ -12391,13 +12391,27 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path in ("/session/manifest.json", "/session/manifest.webmanifest"):
         return _serve_manifest(handler)
 
+    if parsed.path.startswith("/api/user/bots/") and parsed.path.endswith("/soul"):
+        from api.auth import current_principal
+        principal = current_principal(handler)
+        if not isinstance(principal, dict) or not principal.get("id"):
+            return bad(handler, "Forbidden", 403)
+        bot_id = parsed.path[len("/api/user/bots/"):-len("/soul")].strip("/")
+        if not bot_id or "/" in bot_id or not _ROUTE_RE.fullmatch(r"[A-Za-z0-9_-]{1,128}", bot_id):
+            return bad(handler, "Not found", 404)
+        from api.user_bots import read_soul
+        try:
+            return j(handler, {"content": read_soul(bot_id, principal["id"])})
+        except KeyError:
+            return bad(handler, "Not found", 404)
+
     if parsed.path.startswith("/api/user/bots/"):
         from api.auth import current_principal
         principal = current_principal(handler)
         if not isinstance(principal, dict) or not principal.get("id"):
             return bad(handler, "Forbidden", 403)
         bot_id = parsed.path[len("/api/user/bots/"):]
-        if not bot_id or "/" in bot_id:
+        if not bot_id or "/" in bot_id or not _ROUTE_RE.fullmatch(r"[A-Za-z0-9_-]{1,128}", bot_id):
             return bad(handler, "Not found", 404)
         from api.user_bots import get_bot
         bot = get_bot(bot_id, principal["id"])
@@ -12457,6 +12471,18 @@ def handle_get(handler, parsed) -> bool:
             page = (Path(__file__).parent.parent / "static" / "bootstrap-admin.html").resolve().read_text(encoding="utf-8")
             return t(handler, page, content_type="text/html; charset=utf-8")
         page = (Path(__file__).parent.parent / "static" / "admin-users.html").resolve().read_text(encoding="utf-8")
+        from api.auth import csrf_token_for_session, parse_cookie, verify_session
+        cookie_value = parse_cookie(handler)
+        token = csrf_token_for_session(cookie_value) if cookie_value and verify_session(cookie_value) else ""
+        return t(handler, page.replace("window.__CSRF_TOKEN__", json.dumps(token)), content_type="text/html; charset=utf-8")
+
+    if parsed.path in ("/account", "/bot-studio"):
+        from api.auth import current_principal
+        principal = current_principal(handler)
+        if not isinstance(principal, dict):
+            return _redirect(handler, "/login?next=" + parsed.path)
+        filename = "account.html" if parsed.path == "/account" else "bot-studio.html"
+        page = (Path(__file__).parent.parent / "static" / filename).resolve().read_text(encoding="utf-8")
         from api.auth import csrf_token_for_session, parse_cookie, verify_session
         cookie_value = parse_cookie(handler)
         token = csrf_token_for_session(cookie_value) if cookie_value and verify_session(cookie_value) else ""
@@ -17423,6 +17449,24 @@ def handle_post(handler, parsed) -> bool:
         return _handle_session_import_cli(handler, body)
 
     # ── Member bot control plane (POST) ──
+    if parsed.path.startswith("/api/user/bots/") and parsed.path.endswith("/soul"):
+        if not _check_csrf(handler):
+            return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        from api.auth import current_principal
+        principal = current_principal(handler)
+        if not isinstance(principal, dict) or not principal.get("id") or not isinstance(body, dict) or set(body) != {"content"}:
+            return bad(handler, "Invalid request", 400)
+        bot_id = parsed.path[len("/api/user/bots/"):-len("/soul")].strip("/")
+        if not bot_id or "/" in bot_id:
+            return bad(handler, "Not found", 404)
+        from api.user_bots import write_soul
+        try:
+            return j(handler, {"content": write_soul(bot_id, principal["id"], body["content"])})
+        except KeyError:
+            return bad(handler, "Not found", 404)
+        except ValueError as exc:
+            return bad(handler, str(exc), 400)
+
     if parsed.path.startswith("/api/user/bots/") and parsed.path.endswith("/rename"):
         if not _check_csrf(handler):
             return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)

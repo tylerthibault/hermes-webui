@@ -1772,22 +1772,14 @@ function _initNavActionMirrors(){
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',_initNavActionMirrors,{once:true});
 else _initNavActionMirrors();
-function _initRoomsNav(){
-  const apply=async()=>{
-    let authenticated=false;
-    try{
-      const response=await fetch('/api/auth/me',{credentials:'include',cache:'no-store'});
-      if(response.ok){const data=await response.json();authenticated=data&&data.authenticated===true;}
-    }catch(_){/* unauthenticated or unavailable: keep the control hidden */}
-    document.querySelectorAll('[data-room-link]').forEach(link=>{
-      link.style.display=authenticated?'':'none';
-      link.classList.toggle('nav-action-visible',authenticated);
-    });
-  };
-  void apply();
+function _initAccountNav(){
+  const apply=async()=>{let authenticated=false;try{const r=await fetch('/api/auth/me',{credentials:'include',cache:'no-store'});if(r.ok)authenticated=(await r.json()).authenticated===true;}catch(_){}document.querySelectorAll('[data-account-link]').forEach(link=>{link.style.display=authenticated?'':'none';});};void apply();
 }
-if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',_initRoomsNav,{once:true});
-else _initRoomsNav();
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',_initAccountNav,{once:true});else _initAccountNav();
+function _initRoomsNav(){
+  const apply=async()=>{let authenticated=false;try{const r=await fetch('/api/auth/me',{credentials:'include',cache:'no-store'});if(r.ok)authenticated=(await r.json()).authenticated===true;}catch(_){}document.querySelectorAll('[data-room-link]').forEach(link=>{link.style.display=authenticated?'':'none';link.classList.toggle('nav-action-visible',authenticated);});};void apply();
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',_initRoomsNav,{once:true});else _initRoomsNav();
 function _applyDashboardStatus(status){
   const running=!!(status&&status.running);
   const url=running?_dashboardBrowserUrl(status):'';

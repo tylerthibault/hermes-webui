@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import threading
 import uuid
@@ -22,6 +23,8 @@ _BOT_FIELDS = frozenset({"id", "owner_user_id", "name", "home", "status", "creat
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _MAX_BYTES = 4 * 1024 * 1024
+_SOUL_MAX_BYTES = 128 * 1024
+_DEFAULT_SOUL = "# Soul\n\nYou are a helpful, thoughtful assistant.\n\n## Focus\nDescribe this bot's focus and boundaries here.\n"
 _lock = threading.RLock()
 
 
@@ -172,6 +175,8 @@ def create_bot(owner_user_id: str, name: str) -> dict[str, Any]:
         home.parent.mkdir(parents=True, exist_ok=True)
         home.mkdir(exist_ok=False)
         os.chmod(home, 0o700)
+        (home / "SOUL.md").write_text(_DEFAULT_SOUL, encoding="utf-8")
+        os.chmod(home / "SOUL.md", 0o600)
         now = _now()
         bot = {"id": bot_id, "owner_user_id": owner_user_id, "name": name, "home": str(home), "status": "stopped", "created_at": now, "updated_at": now}
         try:
@@ -210,6 +215,43 @@ def delete_bot(bot_id: str, owner_user_id: str) -> dict[str, Any]:
         _write_unlocked(payload)
         shutil.rmtree(home, ignore_errors=True)
         return copy.deepcopy(bot)
+
+
+def read_soul(bot_id: str, owner_user_id: str) -> str:
+    bot = get_bot(bot_id, owner_user_id)
+    if bot is None:
+        raise KeyError(bot_id)
+    path = _validate_home(bot) / "SOUL.md"
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _SOUL_MAX_BYTES:
+            raise RuntimeError("SOUL.md is invalid")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            return os.fdopen(fd, "r", encoding="utf-8").read()
+        except Exception:
+            os.close(fd)
+            raise
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        raise RuntimeError("SOUL.md is invalid") from exc
+
+
+def write_soul(bot_id: str, owner_user_id: str, content: str) -> str:
+    if not isinstance(content, str):
+        raise ValueError("SOUL.md must be text")
+    if len(content.encode("utf-8")) > _SOUL_MAX_BYTES:
+        raise ValueError("SOUL.md is too large")
+    bot = get_bot(bot_id, owner_user_id)
+    if bot is None:
+        raise KeyError(bot_id)
+    home = _validate_home(bot)
+    temporary = home / ".SOUL.md.tmp"
+    temporary.write_text(content, encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, home / "SOUL.md")
+    return content
 
 
 def update_bot_status(bot_id: str, owner_user_id: str, status: str) -> dict[str, Any]:
