@@ -124,7 +124,7 @@ def _attachment_root() -> Path:
 
 def _upload_destination(session_id: str, safe_name: str) -> Path:
     dest_dir = _session_attachment_dir(session_id)
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_attachment_dir(dest_dir)
     dest = (dest_dir / safe_name).resolve()
     if not dest.is_relative_to(dest_dir):
         raise ValueError('Invalid upload destination')
@@ -139,6 +139,50 @@ def _upload_destination(session_id: str, safe_name: str) -> Path:
                 return candidate
         raise ValueError('Too many uploads with the same filename')
     return dest
+
+
+def _ensure_private_attachment_dir(dest_dir: Path) -> None:
+    """Create an attachment inbox that is accessible only to its OS owner."""
+    root = _attachment_root()
+    root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    dest_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if os.name != 'nt':
+        root.chmod(0o700)
+        dest_dir.chmod(0o700)
+
+
+def _write_private_attachment(session_id: str, safe_name: str, data: bytes) -> Path:
+    """Create a private attachment without following links or overwriting files."""
+    dest_dir = _session_attachment_dir(session_id)
+    _ensure_private_attachment_dir(dest_dir)
+    stem = Path(safe_name).stem
+    suffix = Path(safe_name).suffix
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, 'O_CLOEXEC', 0)
+    flags |= getattr(os, 'O_NOFOLLOW', 0)
+
+    for idx in range(1000):
+        name = safe_name if idx == 0 else f'{stem}-{idx}{suffix}'
+        dest = (dest_dir / name).resolve()
+        if not dest.is_relative_to(dest_dir):
+            raise ValueError('Invalid upload destination')
+        try:
+            fd = os.open(dest, flags, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, 'wb', closefd=True) as attachment:
+                attachment.write(data)
+            if os.name != 'nt':
+                dest.chmod(0o600)
+            return dest
+        except Exception:
+            try:
+                dest.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+    raise ValueError('Too many uploads with the same filename')
 
 
 def _session_attachment_dir(session_id: str, *, root: Path | None = None) -> Path:
@@ -224,8 +268,7 @@ def handle_upload(handler):
         if _reject_invisible_session(handler, s):
             return True
         safe_name = _sanitize_upload_name(filename)
-        dest = _upload_destination(session_id, safe_name)
-        dest.write_bytes(file_bytes)
+        dest = _write_private_attachment(session_id, safe_name, file_bytes)
         mime = mimetypes.guess_type(safe_name)[0] or 'application/octet-stream'
         return j(handler, {
             'filename': dest.name,
@@ -402,7 +445,7 @@ def handle_upload_extract(handler):
         if _reject_invisible_session(handler, s):
             return True
         session_dir = _session_attachment_dir(session_id)
-        session_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_private_attachment_dir(session_dir)
         result = extract_archive(file_bytes, filename, session_dir)
         return j(handler, {'ok': True, **result})
     except ValueError as e:
